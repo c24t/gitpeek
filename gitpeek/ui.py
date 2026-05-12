@@ -60,6 +60,13 @@ _GLYPH_CLOSED = "▶"
 _STAT_BAR_WIDTH = 16
 
 
+# Raw key codes for the ``Ctrl-<x>`` combos we recognise. curses
+# delivers these as plain integers (the ASCII control-character values),
+# not via ``KEY_*`` constants, so we just name them ourselves.
+_CTRL_D = 0x04   # half-page down (vim)
+_CTRL_U = 0x15   # half-page up   (vim)
+
+
 def _cp(n: int) -> int:
     """``curses.color_pair`` that's safe to call before ``initscr``.
 
@@ -125,6 +132,12 @@ class UI:
         self.scroll = 0
         self.help_visible = False
         self._cached_rows: list[Row] | None = None
+        # Height of the scrollable content area at last render. Used
+        # by ``Ctrl-D`` / ``Ctrl-U`` to size their jump by half the
+        # current screen. Defaults to something reasonable so the
+        # first keypress before any render still does something
+        # useful instead of jumping by zero.
+        self._last_content_h = 20
         # Widths used to align the stat bar across visible file rows.
         # Recomputed every time the visible-rows list is rebuilt so the
         # left edge of every bar lines up at one column — same idea as
@@ -494,6 +507,17 @@ class UI:
             self.cursor = 0
         elif ch == ord("G"):
             self.cursor = n - 1
+        elif ch == _CTRL_D:
+            # Vim-style half-page jump: ``content_h // 2`` rows, with
+            # a one-row minimum so on tiny terminals the key still
+            # moves something. The render-time scroll logic keeps the
+            # cursor visible afterwards, so we don't need to touch
+            # ``self.scroll`` here.
+            step = max(1, self._last_content_h // 2)
+            self.cursor = min(self.cursor + step, n - 1)
+        elif ch == _CTRL_U:
+            step = max(1, self._last_content_h // 2)
+            self.cursor = max(self.cursor - step, 0)
 
         elif ch in (ord("l"), curses.KEY_RIGHT):
             # crecord semantics: if the current node is folded, unfold
@@ -629,6 +653,9 @@ class UI:
 
         content_y = 2
         content_h = h - content_y
+        # Stash for ``Ctrl-D`` / ``Ctrl-U`` which run between renders
+        # and otherwise have no way to learn the screen height.
+        self._last_content_h = content_h
         rows = self.visible_rows()
 
         # Keep the cursor on-screen. Scroll only as much as needed.
@@ -862,6 +889,8 @@ class UI:
             "    h / ←           close / step out to parent",
             "    J / PgDn        next item of same kind",
             "    K / PgUp        previous item of same kind",
+            "    Ctrl-D          half-page down",
+            "    Ctrl-U          half-page up",
             "    g / G           top / bottom",
             "",
             "  Folding",

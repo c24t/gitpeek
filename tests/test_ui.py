@@ -228,6 +228,50 @@ def test_arrow_keys_match_letters() -> None:
     assert ui.cursor == 0
 
 
+def test_ctrl_d_advances_cursor_by_half_screen() -> None:
+    """``Ctrl-D`` should move down by ``content_h // 2`` rows."""
+    commits = [_stub_metadata_commit(str(i)) for i in range(40)]
+    ui = UI(commits)
+    ui._last_content_h = 10   # simulate a 10-row content area
+    ui._handle_key(0x04)      # Ctrl-D
+    assert ui.cursor == 5
+
+
+def test_ctrl_u_retreats_cursor_by_half_screen() -> None:
+    commits = [_stub_metadata_commit(str(i)) for i in range(40)]
+    ui = UI(commits)
+    ui._last_content_h = 10
+    ui.cursor = 20
+    ui._handle_key(0x15)      # Ctrl-U
+    assert ui.cursor == 15
+
+
+def test_ctrl_d_clamps_to_last_row() -> None:
+    """A half-page jump past the end should land on the last row."""
+    commits = [_stub_metadata_commit(str(i)) for i in range(5)]
+    ui = UI(commits)
+    ui._last_content_h = 20
+    ui._handle_key(0x04)
+    assert ui.cursor == 4   # n - 1 with n = 5
+
+
+def test_ctrl_u_clamps_to_top() -> None:
+    ui = UI([_toy_commit()])
+    ui._last_content_h = 20
+    ui.cursor = 0
+    ui._handle_key(0x15)
+    assert ui.cursor == 0
+
+
+def test_ctrl_d_has_one_row_minimum_on_tiny_terminals() -> None:
+    """A 0- or 1-row content_h shouldn't make ``Ctrl-D`` a no-op."""
+    commits = [_stub_metadata_commit(str(i)) for i in range(10)]
+    ui = UI(commits)
+    ui._last_content_h = 1   # //2 == 0; floor would freeze the cursor
+    ui._handle_key(0x04)
+    assert ui.cursor == 1
+
+
 # -- zR / zM / * --------------------------------------------------------
 
 
