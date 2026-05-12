@@ -125,6 +125,12 @@ class UI:
         self.scroll = 0
         self.help_visible = False
         self._cached_rows: list[Row] | None = None
+        # Widths used to align the stat bar across visible file rows.
+        # Recomputed every time the visible-rows list is rebuilt so the
+        # left edge of every bar lines up at one column — same idea as
+        # ``git diff --stat`` padding paths to a common width.
+        self._file_row_max_prefix = 0
+        self._file_row_max_counts = 0
         # vim-style ``z`` prefix: when True, the next keypress is
         # interpreted as part of a ``z<x>`` sequence (currently ``zM``
         # and ``zR``). Cleared on the next keystroke regardless of
@@ -172,8 +178,44 @@ class UI:
                         if not h.folded:
                             for ln in h.lines:
                                 rows.append(Row(ln, 3, "line", parent_commit=commit))
+        self._recompute_file_row_widths(rows)
         self._cached_rows = rows
         return rows
+
+    def _recompute_file_row_widths(self, rows: list[Row]) -> None:
+        """Find the widest prefix and counts string among visible file rows.
+
+        Used by :meth:`_format_row` to right-pad each file's prefix and
+        counts so every stat bar starts at the same column. Recomputed
+        whenever the visible-rows list is rebuilt — that's the only
+        moment when the set of visible files (and therefore the
+        max-width inputs) can change.
+        """
+
+        max_prefix = 0
+        max_counts = 0
+        for r in rows:
+            if r.kind != "file":
+                continue
+            f: File = r.item
+            indent = _INDENT * r.depth
+            path = f.path
+            if f.old_path and f.old_path != f.path:
+                path = f"{f.old_path} → {f.path}"
+            # Glyph width is one cell whether folded or open, so the
+            # prefix's printed length doesn't depend on fold state.
+            prefix_len = len(f"{indent}{_GLYPH_OPEN} [{f.status}] {path}")
+            max_prefix = max(max_prefix, prefix_len)
+            if not f.binary:
+                # ``+N -M`` — three pieces (plus, space, minus). Binary
+                # files don't contribute because they show "(binary)"
+                # in place of the counts.
+                counts_len = (
+                    len(f"+{f.additions}") + 1 + len(f"-{f.deletions}")
+                )
+                max_counts = max(max_counts, counts_len)
+        self._file_row_max_prefix = max_prefix
+        self._file_row_max_counts = max_counts
 
     def _has_children(self, row: Row) -> bool:
         """True if this row owns at least one child node."""
@@ -708,23 +750,38 @@ class UI:
             path = f.path
             if f.old_path and f.old_path != f.path:
                 path = f"{f.old_path} → {f.path}"
+            # Pad the prefix to the widest one in the visible set so
+            # the counts (and therefore the stat bar) start at a
+            # common column across all file rows. This is the same
+            # alignment trick ``git diff --stat`` does to its paths.
+            prefix = f"{indent}{glyph} [{f.status}] {path}"
+            prefix_padded = prefix.ljust(self._file_row_max_prefix)
             if f.binary:
+                # Binary files keep the aligned prefix but show only a
+                # ``(binary)`` label where the counts would otherwise
+                # be — no bar, since there's nothing to draw.
                 return [
-                    (
-                        f"{indent}{glyph} [{f.status}] {path}  (binary)",
-                        _cp(_CP_FILE),
-                    )
+                    (prefix_padded + "  ", _cp(_CP_FILE)),
+                    ("(binary)", _cp(_CP_FILE)),
                 ]
-            # Header (yellow) + stat bar (green pluses + red minuses,
-            # matching ``git diff --stat`` in a color terminal). We
-            # build the bar from the parent commit's max-changes so
-            # bars across the same commit scale relative to each other.
-            header = (
-                f"{indent}{glyph} [{f.status}] {path}  "
-                f"(+{f.additions} -{f.deletions}) "
-            )
+            # ``+N -M`` instead of ``(+N -M)`` — closer to GitHub's
+            # PR-summary and ``git --shortstat`` idiom — with each
+            # count carrying the same color as the matching sigil on
+            # diff body lines (green for ``+``, red for ``-``).
+            add_str = f"+{f.additions}"
+            del_str = f"-{f.deletions}"
+            counts_len = len(add_str) + 1 + len(del_str)
+            # After the (variable-width) counts, pad to the widest
+            # observed counts and then add a two-space gap before the
+            # bar. The padding lives in the file color so the
+            # reverse-video cursor highlight still extends cleanly.
+            gap_width = (self._file_row_max_counts - counts_len) + 2
             segments: list[tuple[str, int]] = [
-                (header, _cp(_CP_FILE)),
+                (prefix_padded + "  ", _cp(_CP_FILE)),
+                (add_str, _cp(_CP_ADD)),
+                (" ", _cp(_CP_FILE)),
+                (del_str, _cp(_CP_DEL)),
+                (" " * gap_width, _cp(_CP_FILE)),
             ]
             max_total = (
                 row.parent_commit.max_file_changes if row.parent_commit else 0

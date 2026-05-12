@@ -565,34 +565,51 @@ def test_stat_bar_empty_for_zero_change_file() -> None:
     assert (n_add, n_del) == (0, 0)
 
 
-def test_file_row_renders_with_green_plus_red_minus_segments() -> None:
-    """The file row should be three segments: header, ``+``s, ``-``s.
+def test_file_row_bar_has_right_number_of_pluses_and_minuses() -> None:
+    """The trailing bar should contain one ``+`` per addition and one
 
-    Each ``+`` segment carries the green color pair and each ``-``
-    segment carries the red color pair, so the terminal renders the
-    bar exactly like ``git diff --stat`` would."""
+    ``-`` per deletion (when below the scaling threshold)."""
     ui = UI([_toy_commit()])
-    # Navigate to the first file row.
-    rows = ui.visible_rows()
-    file_row = next(r for r in rows if r.kind == "file")
+    file_row = next(r for r in ui.visible_rows() if r.kind == "file")
     segments = ui._format_row(file_row)
-    # First segment carries the file header.
-    header_text, _header_attr = segments[0]
-    assert "[M]" in header_text and "a.py" in header_text
-    # The remaining segments should be the bar characters.
-    bar_segments = segments[1:]
-    assert all(set(text) <= {"+", "-"} for text, _ in bar_segments)
-    # The flattened bar contains the right number of each.
-    bar_chars = _flatten_segments(bar_segments)
+    # Bar segments are the trailing ones whose text is purely ``+`` or
+    # ``-`` characters — the count segments contain digits too, so
+    # ``set(text) == {"+"}`` distinguishes them cleanly.
+    bar_pluses = "".join(t for t, _ in segments if t and set(t) == {"+"})
+    bar_minuses = "".join(t for t, _ in segments if t and set(t) == {"-"})
     f = ui.commits[0].files[0]
-    assert bar_chars.count("+") == f.additions
-    assert bar_chars.count("-") == f.deletions
+    assert len(bar_pluses) == f.additions
+    assert len(bar_minuses) == f.deletions
+
+
+def test_file_row_counts_share_color_with_matching_bar_sigil() -> None:
+    """``+N`` should be the same color as the bar's ``+`` characters,
+
+    and ``-M`` the same as the bar's ``-`` characters. That mirrors
+    the colouring of ``+`` / ``-`` sigils on diff body lines."""
+    ui = UI([_toy_commit()])
+    file_row = next(r for r in ui.visible_rows() if r.kind == "file")
+    segments = ui._format_row(file_row)
+    # The count segments are the ones that contain both a sign and a
+    # digit; the bar segments are pure sigil runs.
+    add_count = next(
+        s for s in segments
+        if s[0].startswith("+") and any(c.isdigit() for c in s[0])
+    )
+    del_count = next(
+        s for s in segments
+        if s[0].startswith("-") and any(c.isdigit() for c in s[0])
+    )
+    bar_add = next(s for s in segments if s[0] and set(s[0]) == {"+"})
+    bar_del = next(s for s in segments if s[0] and set(s[0]) == {"-"})
+    assert add_count[1] == bar_add[1]
+    assert del_count[1] == bar_del[1]
 
 
 def test_binary_file_row_has_no_stat_bar() -> None:
-    """Binary files should render as a single segment with ``(binary)``
+    """Binary files should render only as ``[B] path  (binary)``
 
-    and no bar — we have no add/delete count to show."""
+    — no counts, no bar."""
     c = _toy_commit()
     c.files = [
         File(path="logo.png", old_path=None, status="B", hunks=[], binary=True),
@@ -600,9 +617,99 @@ def test_binary_file_row_has_no_stat_bar() -> None:
     ui = UI([c])
     file_row = next(r for r in ui.visible_rows() if r.kind == "file")
     segments = ui._format_row(file_row)
-    assert len(segments) == 1
-    text, _ = segments[0]
-    assert "(binary)" in text and "+" not in text and "-" not in text
+    # No bar segments (pure +/- runs) and no digit-bearing count
+    # segments — only the prefix and the literal ``(binary)`` label.
+    flat = _flatten_segments(segments)
+    assert "(binary)" in flat
+    assert "+" not in flat and "-" not in flat
+    assert "[B]" in flat and "logo.png" in flat
+
+
+def test_file_row_stat_bars_align_across_different_path_widths() -> None:
+    """The point of padding: bars from short and long paths should
+
+    start at the same column so the user can compare them visually."""
+    c = _toy_commit()
+    short = File(
+        path="a.py",
+        old_path=None,
+        status="M",
+        hunks=[
+            Hunk(
+                header="@@ -1,1 +1,1 @@",
+                old_start=1,
+                old_count=1,
+                new_start=1,
+                new_count=1,
+                context="",
+                lines=[Line("-", "old"), Line("+", "new")],
+            ),
+        ],
+    )
+    longer = File(
+        path="much/longer/path/name.py",
+        old_path=None,
+        status="M",
+        hunks=[
+            Hunk(
+                header="@@ -1,1 +1,1 @@",
+                old_start=1,
+                old_count=1,
+                new_start=1,
+                new_count=1,
+                context="",
+                lines=[Line("-", "old"), Line("+", "new")],
+            ),
+        ],
+    )
+    c.files = [short, longer]
+    ui = UI([c])
+
+    def bar_start_col(row) -> int:
+        col = 0
+        for text, _ in ui._format_row(row):
+            if text and set(text) == {"+"}:
+                return col
+            col += len(text)
+        return col
+
+    file_rows = [r for r in ui.visible_rows() if r.kind == "file"]
+    cols = [bar_start_col(r) for r in file_rows]
+    assert len(set(cols)) == 1, f"bars start at different columns: {cols}"
+
+
+def test_file_row_counts_align_across_different_count_widths() -> None:
+    """Files with single- vs. multi-digit counts should both have the
+
+    bar at the same column — the counts column is padded to its widest
+    visible entry."""
+    c = _toy_commit()
+    small = File(path="a.py", old_path=None, status="M", hunks=[
+        Hunk(header="@@ -1,1 +1,1 @@",
+             old_start=1, old_count=1, new_start=1, new_count=1,
+             context="",
+             lines=[Line("+", "x")]),
+    ])
+    big = File(path="b.py", old_path=None, status="M", hunks=[
+        Hunk(header="@@ -1,1 +1,1 @@",
+             old_start=1, old_count=1, new_start=1, new_count=1,
+             context="",
+             lines=[Line("+", "x")] * 100 + [Line("-", "y")] * 100),
+    ])
+    c.files = [small, big]
+    ui = UI([c])
+
+    def bar_start_col(row) -> int:
+        col = 0
+        for text, _ in ui._format_row(row):
+            if text and set(text) == {"+"}:
+                return col
+            col += len(text)
+        return col
+
+    file_rows = [r for r in ui.visible_rows() if r.kind == "file"]
+    cols = [bar_start_col(r) for r in file_rows]
+    assert len(set(cols)) == 1, f"bars start at different columns: {cols}"
 
 
 # -- lazy loading -------------------------------------------------------
