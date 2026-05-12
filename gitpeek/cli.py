@@ -2,12 +2,14 @@
 
 Usage:
 
-    gitpeek                  # browse HEAD in the current directory
-    gitpeek <ref>            # browse a different commit (e.g. ``HEAD~1``, a SHA)
-    gitpeek -C <path>        # run as if from ``<path>`` (like ``git -C``)
+    gitpeek                  # browse the full log of the current repo
+    gitpeek <ref>            # browse the log starting at <ref> (e.g.
+                             # a SHA, ``HEAD~10``, ``main..feature``)
+    gitpeek -n 50            # cap the log at 50 commits
+    gitpeek -C <path>        # run as if from <path> (like ``git -C``)
 
-Exits non-zero with a short error message when not inside a git repo or
-when the requested ref doesn't resolve.
+Exits non-zero with a short error message when not inside a git repo
+or when the requested ref doesn't resolve.
 """
 
 from __future__ import annotations
@@ -16,20 +18,31 @@ import argparse
 import sys
 
 from gitpeek import __version__
-from gitpeek.git import GitError, load_commit
+from gitpeek.git import GitError, load_log
 from gitpeek.ui import run as run_ui
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gitpeek",
-        description="Read-only, hg crecord-style browser for a git commit.",
+        description="Read-only, hg crecord-style browser for a git log.",
     )
     parser.add_argument(
         "ref",
         nargs="?",
         default="HEAD",
-        help="Commit to browse (default: HEAD). Anything `git rev-parse` accepts.",
+        help=(
+            "Where the log starts (default: HEAD). Anything "
+            "`git rev-parse` accepts — a SHA, branch, or range."
+        ),
+    )
+    parser.add_argument(
+        "-n",
+        "--max-count",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Show at most N commits (default: no limit).",
     )
     parser.add_argument(
         "-C",
@@ -49,20 +62,18 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        commit = load_commit(ref=args.ref, cwd=args.cwd)
+        commits = load_log(
+            ref=args.ref,
+            max_count=args.max_count,
+            cwd=args.cwd,
+        )
     except GitError as exc:
         print(f"gitpeek: {exc}", file=sys.stderr)
         return 2
 
-    if not commit.files:
-        # No diff at all — show the user something useful instead of
-        # dropping them into an empty curses screen.
-        print(
-            f"commit {commit.short_sha}  {commit.subject}\n"
-            f"  no file changes (merge commit? empty commit?)",
-            file=sys.stderr,
-        )
+    if not commits:
+        print(f"gitpeek: no commits reachable from {args.ref}", file=sys.stderr)
         return 0
 
-    run_ui(commit)
+    run_ui(commits, cwd=args.cwd)
     return 0

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from gitpeek.diff import Commit, File, Hunk, Line, Message
+from gitpeek.git import GitError, load_diff
 
 
 # Color pair indices. ``curses.init_pair`` uses 1-based indexing and 0
@@ -69,20 +70,31 @@ class Row:
 
 
 class UI:
-    """Stateful curses application — instantiate once, call :meth:`run`."""
+    """Stateful curses application — instantiate once, call :meth:`run`.
 
-    def __init__(self, commit: Commit) -> None:
-        self.commit = commit
-        # By default we want the commit row open (so the user sees
-        # files immediately) but every file *and* every hunk collapsed,
-        # so each press of ``l`` reveals exactly one more level. That
-        # matches the depth-by-depth feel of ``hg commit -i`` and keeps
-        # the initial view to a screen of file headers even for big
-        # commits.
-        for f in commit.files:
-            f.folded = True
-            for h in f.hunks:
-                h.folded = True
+    The constructor takes the full list of commits (typically
+    :func:`gitpeek.git.load_log`) and the working directory the log
+    came from, so the UI can fetch each commit's diff on demand. Every
+    commit and every already-loaded subtree starts folded — the user
+    is looking at a log, not a wall of diffs — and depth-by-depth
+    navigation reveals exactly one level per ``l`` press.
+    """
+
+    def __init__(self, commits: list[Commit], cwd: str | None = None) -> None:
+        self.commits = commits
+        self.cwd = cwd
+        # Force a depth-by-depth start state on any *loaded* subtree:
+        # every file and hunk begins folded so each ``l`` press reveals
+        # exactly one more level. We deliberately leave ``commit.folded``
+        # alone — its dataclass default is True (log-view friendly),
+        # but a caller that wants a particular commit pre-opened
+        # (tests, ``gitpeek -n 1``-style flows) can pass it in
+        # ``folded=False`` and we'll respect that.
+        for c in commits:
+            for f in c.files:
+                f.folded = True
+                for h in f.hunks:
+                    h.folded = True
         self.cursor = 0
         self.scroll = 0
         self.help_visible = False
@@ -112,18 +124,21 @@ class UI:
 
         if self._cached_rows is not None:
             return self._cached_rows
-        rows: list[Row] = [Row(self.commit, 0, "commit")]
-        if not self.commit.folded:
+        rows: list[Row] = []
+        for commit in self.commits:
+            rows.append(Row(commit, 0, "commit"))
+            if commit.folded:
+                continue
             # Message comes before files so the natural top-to-bottom
-            # order under a commit is "why" then "what" — same shape as
-            # a ``git log -p`` page.
-            msg = self.commit.message
+            # order under a commit is "why" then "what" — same shape
+            # as a ``git log -p`` page.
+            msg = commit.message
             if msg.lines:
                 rows.append(Row(msg, 1, "message"))
                 if not msg.folded:
                     for line in msg.lines:
                         rows.append(Row(line, 2, "message_line"))
-            for f in self.commit.files:
+            for f in commit.files:
                 rows.append(Row(f, 1, "file"))
                 if not f.folded:
                     for h in f.hunks:
@@ -138,10 +153,15 @@ class UI:
         """True if this row owns at least one child node."""
         item = row.item
         if isinstance(item, Commit):
-            # A commit has children whenever it has either a message
-            # body or any files to show — we treat the message subtree
-            # as a first-class child so the user can open a commit that
-            # has prose but no diff (root commits, empty merges).
+            # Before lazy-loading we can't *know* whether a commit has
+            # any files — only its message-presence is visible from the
+            # metadata pass. Treat unloaded commits as "potentially has
+            # children" so ``l`` will attempt the load; once loaded we
+            # use the actual file/message presence so navigation around
+            # truly empty commits (root commit with no parents, empty
+            # merge) stops behaving as if there's something to open.
+            if not item._loaded:
+                return True
             return bool(item.files) or bool(item.message.lines)
         if isinstance(item, Message):
             return bool(item.lines)
@@ -150,6 +170,33 @@ class UI:
         if isinstance(item, Hunk):
             return bool(item.lines)
         return False
+
+    def _ensure_loaded(self, commit: Commit) -> None:
+        """Lazy-fetch ``commit``'s diff on first access.
+
+        Idempotent — repeated calls are free. Failures (bad ref,
+        permission error) are swallowed so the UI can keep running;
+        the affected commit will simply appear to have no files. We
+        choose silent degradation over raising into the curses loop
+        because there's no good way to surface a one-off error mid-
+        navigation without disrupting the whole view.
+        """
+
+        if commit._loaded:
+            return
+        try:
+            commit.files = load_diff(commit.sha, cwd=self.cwd)
+        except GitError:
+            commit.files = []
+        # Newly loaded files default to ``folded=False``; fold them so
+        # the user's first ``l`` after the load reveals one level, not
+        # the entire diff at once.
+        for f in commit.files:
+            f.folded = True
+            for h in f.hunks:
+                h.folded = True
+        commit._loaded = True
+        self._invalidate()
 
     def _collect_subtree_foldables(self, row: Row) -> list:
         """Return all foldable nodes in the subtree rooted at ``row``.
@@ -200,14 +247,24 @@ class UI:
         get started", which is hostile rather than helpful.
         """
 
-        if self.commit.message.lines:
-            self.commit.message.folded = folded
-        for f in self.commit.files:
-            if f.hunks:
-                f.folded = folded
-            for h in f.hunks:
-                if h.lines:
-                    h.folded = folded
+        for commit in self.commits:
+            if not folded:
+                # ``zR`` means "open everything." For commits we
+                # haven't seen yet, that requires fetching the diff so
+                # the unfold has something to reveal. Loading every
+                # commit is the user's explicit ask — they pressed the
+                # "give me all the things" key — and they can ``zM``
+                # back if it turns out to be too much.
+                self._ensure_loaded(commit)
+            commit.folded = folded
+            if commit.message.lines:
+                commit.message.folded = folded
+            for f in commit.files:
+                if f.hunks:
+                    f.folded = folded
+                for h in f.hunks:
+                    if h.lines:
+                        h.folded = folded
         self._invalidate()
         new_rows = self.visible_rows()
         if self.cursor >= len(new_rows):
@@ -300,6 +357,11 @@ class UI:
             # behaviour is what makes l/h feel like a directional tree
             # walk instead of a fold toggle.
             item = row.item
+            # Pull the diff on first unfold so ``_has_children`` knows
+            # whether there's anything to reveal. No-op for already-
+            # loaded commits and for non-Commit nodes.
+            if isinstance(item, Commit) and item.folded:
+                self._ensure_loaded(item)
             if hasattr(item, "folded") and self._has_children(row):
                 if item.folded:
                     item.folded = False
@@ -329,6 +391,10 @@ class UI:
             # "I just want to flip this regardless of where the cursor
             # ends up" key.
             item = row.item
+            # Same lazy-load rationale as ``l``: a folded commit needs
+            # its diff fetched before we can usefully expand it.
+            if isinstance(item, Commit) and item.folded:
+                self._ensure_loaded(item)
             if hasattr(item, "folded") and self._has_children(row):
                 item.folded = not item.folded
                 self._invalidate()
@@ -376,6 +442,12 @@ class UI:
             # subtree is already open do we fold it. This makes ``*``
             # idempotent toward "fully open" in two keypresses no
             # matter what state you start from.
+            # Lazy-load if the cursor is sitting on an unloaded commit
+            # — otherwise the "any closed" check would only see the
+            # commit's own fold flag and miss the (yet-to-be-fetched)
+            # files entirely.
+            if isinstance(row.item, Commit):
+                self._ensure_loaded(row.item)
             nodes = self._collect_subtree_foldables(row)
             if nodes:
                 any_closed = any(n.folded for n in nodes)
@@ -479,11 +551,22 @@ class UI:
         if row.kind == "commit":
             c: Commit = row.item
             glyph = _GLYPH_CLOSED if c.folded else _GLYPH_OPEN
-            n_files = len(c.files)
-            files_word = "file" if n_files == 1 else "files"
+            # ``--date=iso`` gives us ``YYYY-MM-DD HH:MM:SS ±HHMM``; for
+            # the log row the calendar date alone is enough, and it
+            # leaves room for a longer subject line on narrow terminals.
+            date_short = c.date[:10]
+            if c._loaded:
+                n_files = len(c.files)
+                files_word = "file" if n_files == 1 else "files"
+                suffix = f"  ({n_files} {files_word})"
+            else:
+                # No file count until the diff has actually been
+                # fetched — showing ``(0 files)`` for every unfetched
+                # commit in the log would be both wrong and noisy.
+                suffix = ""
             text = (
-                f"{glyph} commit {c.short_sha}  {c.subject}  "
-                f"— {c.author}, {c.date}  ({n_files} {files_word})"
+                f"{glyph} {c.short_sha}  {date_short}  {c.subject}  "
+                f"— {c.author}{suffix}"
             )
             return text, curses.color_pair(_CP_COMMIT) | curses.A_BOLD
 
@@ -585,10 +668,10 @@ class UI:
             stdscr.addnstr(y0 + 1 + i, x0 + 1, line.ljust(box_w - 2), box_w - 2, attr)
 
 
-def run(commit: Commit) -> None:
+def run(commits: list[Commit], cwd: str | None = None) -> None:
     """Convenience wrapper: set locale, hand off to :func:`curses.wrapper`."""
 
     # Without this, curses on macOS sometimes fails to render the
     # triangle glyphs in our row markers.
     locale.setlocale(locale.LC_ALL, "")
-    curses.wrapper(UI(commit).run)
+    curses.wrapper(UI(commits, cwd=cwd).run)

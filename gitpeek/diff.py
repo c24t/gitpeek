@@ -117,7 +117,14 @@ class Message:
 
 @dataclass
 class Commit:
-    """The commit being browsed (HEAD, by default)."""
+    """A single commit in the log being browsed.
+
+    ``files`` is empty and ``_loaded`` is ``False`` until the UI
+    triggers a diff fetch — see :func:`gitpeek.git.load_diff`. This
+    lazy split lets the log view show thousands of commits cheaply and
+    only pay the per-commit ``git show`` cost when the user actually
+    opens one.
+    """
 
     sha: str
     short_sha: str
@@ -126,10 +133,16 @@ class Commit:
     subject: str
     message: Message
     files: list[File] = field(default_factory=list)
-    # The commit node starts unfolded — that's the whole point of opening
-    # the tool — but we keep the flag here so the UI's fold logic can
-    # treat all three node types uniformly.
-    folded: bool = False
+    # In the log view every commit starts folded — the user is looking
+    # at a list of subjects, not at a wall of diffs — but we keep the
+    # flag here so the UI's fold logic can treat all node types
+    # uniformly.
+    folded: bool = True
+    # ``True`` once we've fetched this commit's diff. Used by the UI to
+    # gate lazy loading (don't refetch what's already here) and to
+    # decide whether to show the ``(N files)`` suffix on the commit
+    # row (showing ``(0 files)`` before loading would be a lie).
+    _loaded: bool = False
 
 
 def parse_diff(text: str) -> list[File]:
