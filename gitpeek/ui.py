@@ -131,6 +131,13 @@ class UI:
         # ``git diff --stat`` padding paths to a common width.
         self._file_row_max_prefix = 0
         self._file_row_max_counts = 0
+        # Largest ``additions + deletions`` among visible file rows.
+        # Used as the scaling input for stat bars, so a file's bar
+        # length is proportional to every other *open* file in the log
+        # rather than only its commit-siblings. This makes bars
+        # comparable across commits at the cost of churn: opening or
+        # closing a commit can change the max and therefore every bar.
+        self._file_row_max_changes = 0
         # vim-style ``z`` prefix: when True, the next keypress is
         # interpreted as part of a ``z<x>`` sequence (currently ``zM``
         # and ``zR``). Cleared on the next keystroke regardless of
@@ -194,6 +201,7 @@ class UI:
 
         max_prefix = 0
         max_counts = 0
+        max_changes = 0
         for r in rows:
             if r.kind != "file":
                 continue
@@ -214,8 +222,10 @@ class UI:
                     len(f"+{f.additions}") + 1 + len(f"-{f.deletions}")
                 )
                 max_counts = max(max_counts, counts_len)
+                max_changes = max(max_changes, f.additions + f.deletions)
         self._file_row_max_prefix = max_prefix
         self._file_row_max_counts = max_counts
+        self._file_row_max_changes = max_changes
 
     def _has_children(self, row: Row) -> bool:
         """True if this row owns at least one child node."""
@@ -783,10 +793,14 @@ class UI:
                 (del_str, _cp(_CP_DEL)),
                 (" " * gap_width, _cp(_CP_FILE)),
             ]
-            max_total = (
-                row.parent_commit.max_file_changes if row.parent_commit else 0
-            )
-            n_add, n_del = self._stat_bar_widths(f, max_total)
+            # Scale bars against the largest file *anywhere in the
+            # currently-visible set*, not just inside this commit, so
+            # you can compare a hunk-heavy file in one commit to a
+            # quiet file in another. The trade-off is that opening or
+            # closing a commit can shift the scaling for everyone
+            # else — visible_rows recomputes the max on each rebuild
+            # so the bars stay in sync.
+            n_add, n_del = self._stat_bar_widths(f, self._file_row_max_changes)
             if n_add:
                 segments.append(("+" * n_add, _cp(_CP_ADD)))
             if n_del:

@@ -678,6 +678,91 @@ def test_file_row_stat_bars_align_across_different_path_widths() -> None:
     assert len(set(cols)) == 1, f"bars start at different columns: {cols}"
 
 
+def test_stat_bars_scale_across_open_commits_not_just_within() -> None:
+    """The largest file across *all* open commits should fill the bar.
+
+    A small commit opened alongside a big one should see its bars
+    truncated, because the global scale is set by the big commit's
+    largest file."""
+    # Tiny commit: one file, 1 addition + 0 deletions.
+    tiny = _toy_commit(sha="t")
+    tiny.files = [
+        File(path="tiny.py", old_path=None, status="M", hunks=[
+            Hunk(header="@@ -1 +1,1 @@",
+                 old_start=1, old_count=1, new_start=1, new_count=1,
+                 context="",
+                 lines=[Line("+", "x")]),
+        ]),
+    ]
+    # Big commit: one file, lots of changes — large enough that the
+    # scaling kicks in past the 1:1 threshold (16 chars).
+    big = _toy_commit(sha="b")
+    big.files = [
+        File(path="big.py", old_path=None, status="M", hunks=[
+            Hunk(header="@@ -1 +1,1 @@",
+                 old_start=1, old_count=1, new_start=1, new_count=1,
+                 context="",
+                 lines=[Line("+", "x")] * 200),
+        ]),
+    ]
+    ui = UI([tiny, big])
+
+    def bar_len(file_row) -> int:
+        segs = ui._format_row(file_row)
+        return sum(len(t) for t, _ in segs if t and set(t) <= {"+", "-"} and t)
+
+    file_rows = [r for r in ui.visible_rows() if r.kind == "file"]
+    # The big file fills the bar (16 chars); the tiny file gets just
+    # one ``+`` because its one change scales to almost nothing
+    # against 200 — but it must not vanish, by the "≥1 if non-zero"
+    # rule baked into ``_stat_bar_widths``.
+    big_row = next(r for r in file_rows if r.item.path == "big.py")
+    tiny_row = next(r for r in file_rows if r.item.path == "tiny.py")
+    assert bar_len(big_row) == 16
+    assert bar_len(tiny_row) == 1
+
+
+def test_closing_a_commit_rescales_remaining_bars() -> None:
+    """Closing the big commit should free the tiny one's bars to use
+
+    the full 1:1 mapping again, since the new global max drops back
+    below the bar-width threshold."""
+    tiny = _toy_commit(sha="t")
+    tiny.files = [
+        File(path="tiny.py", old_path=None, status="M", hunks=[
+            Hunk(header="@@ -1 +1,3 @@",
+                 old_start=1, old_count=1, new_start=1, new_count=3,
+                 context="",
+                 lines=[Line("+", "x"), Line("+", "y"), Line("+", "z")]),
+        ]),
+    ]
+    big = _toy_commit(sha="b")
+    big.files = [
+        File(path="big.py", old_path=None, status="M", hunks=[
+            Hunk(header="@@ -1 +1,1 @@",
+                 old_start=1, old_count=1, new_start=1, new_count=1,
+                 context="",
+                 lines=[Line("+", "x")] * 200),
+        ]),
+    ]
+    ui = UI([tiny, big])
+
+    def tiny_bar_len() -> int:
+        row = next(
+            r for r in ui.visible_rows()
+            if r.kind == "file" and r.item.path == "tiny.py"
+        )
+        segs = ui._format_row(row)
+        return sum(len(t) for t, _ in segs if t and set(t) <= {"+", "-"} and t)
+
+    # While big is open, tiny gets one char per side (scaled down).
+    assert tiny_bar_len() < 3
+    # Close the big commit and tiny gets the full 1:1 (3 chars).
+    big.folded = True
+    ui._invalidate()
+    assert tiny_bar_len() == 3
+
+
 def test_file_row_counts_align_across_different_count_widths() -> None:
     """Files with single- vs. multi-digit counts should both have the
 
