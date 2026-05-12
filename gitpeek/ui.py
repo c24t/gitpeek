@@ -315,6 +315,22 @@ class UI:
                 nodes.append(item)
         return nodes
 
+    def _toggle_fold(self, row: Row) -> None:
+        """Flip the fold flag on ``row``'s item, lazy-loading if needed.
+
+        Shared by ``f`` and ``SPACE``. Lazy-loads when we're about to
+        unfold a previously-folded commit so the new state has files
+        to reveal; no-op when the cursor is on a node without
+        children (e.g., a line row or an empty commit).
+        """
+
+        item = row.item
+        if isinstance(item, Commit) and item.folded:
+            self._ensure_loaded(item)
+        if hasattr(item, "folded") and self._has_children(row):
+            item.folded = not item.folded
+            self._invalidate()
+
     def _fold_tree(
         self, folded: bool, scope_commit: Commit | None = None
     ) -> None:
@@ -515,17 +531,10 @@ class UI:
                         break
 
         elif ch == ord("f"):
-            # Plain toggle. ``l``/``h`` are directional; ``f`` is the
+            # Plain toggle. ``l`` / ``h`` are directional; ``f`` is the
             # "I just want to flip this regardless of where the cursor
             # ends up" key.
-            item = row.item
-            # Same lazy-load rationale as ``l``: a folded commit needs
-            # its diff fetched before we can usefully expand it.
-            if isinstance(item, Commit) and item.folded:
-                self._ensure_loaded(item)
-            if hasattr(item, "folded") and self._has_children(row):
-                item.folded = not item.folded
-                self._invalidate()
+            self._toggle_fold(row)
 
         elif ch == ord("F"):
             # Fold current + ancestors. Useful for getting back to a
@@ -588,10 +597,11 @@ class UI:
                     self.cursor = len(new_rows) - 1
 
         elif ch == ord(" "):
-            # crecord uses space to (un-)select; we have no selection,
-            # but we eat the keypress so the muscle memory doesn't move
-            # the cursor unexpectedly.
-            pass
+            # Space is the easy one-finger fold toggle — same effect
+            # as ``f``. crecord uses space for (un-)select, but we
+            # have no selection model, so this is the most useful
+            # thing to bind it to without breaking muscle memory.
+            self._toggle_fold(row)
 
         elif ch == curses.KEY_RESIZE:
             # Curses delivers a synthetic key when the terminal is
@@ -842,7 +852,7 @@ class UI:
             "    g / G           top / bottom",
             "",
             "  Folding",
-            "    f               fold / unfold current item",
+            "    f / SPACE       fold / unfold current item",
             "    F               fold current + all ancestors",
             "    *               toggle subtree (open all if any closed)",
             "    zM              fold; on a commit row affects every",

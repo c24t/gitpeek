@@ -210,6 +210,19 @@ def test_arrow_keys_match_letters() -> None:
 # -- zR / zM / * --------------------------------------------------------
 
 
+def test_space_toggles_fold_like_f() -> None:
+    """``SPACE`` and ``f`` should behave identically: flip the fold on
+
+    the current node, lazy-loading commits when needed."""
+    ui = UI([_toy_commit()])
+    ui._handle_key(ord("j"))   # cursor → first file (folded by default)
+    ui._handle_key(ord(" "))   # unfold via space
+    a = ui.commits[0].files[0]
+    assert a.folded is False
+    ui._handle_key(ord(" "))   # fold back via space
+    assert a.folded is True
+
+
 def test_zR_unfolds_every_file_and_hunk() -> None:
     ui = UI([_toy_commit()])
     ui._handle_key(ord("z"))
