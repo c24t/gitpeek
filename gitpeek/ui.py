@@ -729,6 +729,19 @@ class UI:
         if row.kind == "commit":
             c: Commit = row.item
             glyph = _GLYPH_CLOSED if c.folded else _GLYPH_OPEN
+            if c.is_working_tree:
+                # The synthetic "uncommitted changes" entry has no
+                # sha, author, or date — render it in cyan with a
+                # ``working tree`` placeholder so it reads as a
+                # different *kind* of thing than the magenta commit
+                # rows below it, but uses the same fold/expand affordances.
+                n_files = len(c.files)
+                files_word = "file" if n_files == 1 else "files"
+                text = (
+                    f"{glyph} working tree  {c.subject}"
+                    f"  ({n_files} {files_word})"
+                )
+                return [(text, _cp(_CP_HUNK) | curses.A_BOLD)]
             # ``--date=iso`` gives us ``YYYY-MM-DD HH:MM:SS ±HHMM``; for
             # the log row the calendar date alone is enough, and it
             # leaves room for a longer subject line on narrow terminals.

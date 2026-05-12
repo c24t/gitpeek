@@ -82,6 +82,27 @@ def _toy_commit(body: str = "", subject: str = "toy", sha: str = "0") -> Commit:
     )
 
 
+def _toy_working_tree(*, files: list[File] | None = None) -> Commit:
+    """Return a synthetic ``working tree`` commit for UI tests.
+
+    Mirrors what :func:`gitpeek.git.load_uncommitted` produces: empty
+    sha / author / date, ``is_working_tree=True``, eagerly loaded.
+    """
+
+    return Commit(
+        sha="",
+        short_sha="working tree",
+        author="",
+        date="",
+        subject="Uncommitted changes",
+        message=Message(body=""),
+        files=files if files is not None else [],
+        folded=True,
+        _loaded=True,
+        is_working_tree=True,
+    )
+
+
 def _stub_metadata_commit(sha: str, subject: str = "stub") -> Commit:
     """Return a commit with only metadata — no files, ``_loaded=False``.
 
@@ -369,6 +390,98 @@ def test_zR_unfolds_message_along_with_everything_else() -> None:
     ui._handle_key(ord("z"))
     ui._handle_key(ord("R"))
     assert ui.commits[0].message.folded is False
+
+
+# -- working-tree section ----------------------------------------------
+
+
+def test_working_tree_row_uses_a_distinct_format(monkeypatch) -> None:
+    """The synthetic uncommitted-changes row should advertise itself.
+
+    It must not look like a regular commit — no sha, date, or author
+    — and the colour should differ from the magenta used for real
+    commits so the user notices it as a different *kind* of entry.
+    We patch ``_cp`` to echo its input so the test can compare which
+    colour-pair *constant* each row asks for, without needing a real
+    curses screen."""
+    monkeypatch.setattr(ui_module, "_cp", lambda n: n)
+    wt = _toy_working_tree(files=_toy_commit().files)
+    wt.folded = False
+    real = _toy_commit(sha="r")
+    ui = UI([wt, real])
+    rows = ui.visible_rows()
+    wt_row = next(r for r in rows if r.kind == "commit" and r.item is wt)
+    real_row = next(r for r in rows if r.kind == "commit" and r.item is real)
+    wt_segments = ui._format_row(wt_row)
+    real_segments = ui._format_row(real_row)
+    wt_text = "".join(t for t, _ in wt_segments)
+    assert "working tree" in wt_text
+    assert "Uncommitted changes" in wt_text
+    # No sha-like hex prefix, no author dash, no date on the WT row.
+    assert real.short_sha not in wt_text
+    assert "—" not in wt_text
+    # Strip the shared ``A_BOLD`` bit; compare the colour portions of
+    # each row's attribute. They must differ.
+    wt_attr = wt_segments[0][1] & ~curses.A_BOLD
+    real_attr = real_segments[0][1] & ~curses.A_BOLD
+    assert wt_attr != real_attr
+
+
+def test_working_tree_does_not_trigger_lazy_load(monkeypatch) -> None:
+    """Pressing ``l`` on the working-tree row must not fire ``load_diff``.
+
+    The synthetic commit is constructed already-loaded, so any call to
+    the lazy loader would be both wasteful and (worse) a real
+    ``git show ''`` against an empty sha."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        ui_module,
+        "load_diff",
+        lambda sha, cwd=None: seen.append(sha) or [],
+    )
+    wt = _toy_working_tree(files=_toy_commit().files)
+    ui = UI([wt])
+    ui._handle_key(ord("l"))   # unfold
+    ui._handle_key(ord("h"))   # fold back
+    ui._handle_key(ord("l"))   # unfold again
+    assert seen == []   # never went to the loader
+
+
+def test_working_tree_files_participate_in_stat_bar_scaling() -> None:
+    """Working-tree files should be part of the global bar-scale max.
+
+    Otherwise a huge pending change wouldn't dominate the scaling the
+    same way a huge commit would."""
+    wt = _toy_working_tree(files=[
+        File(path="big.py", old_path=None, status="M", hunks=[
+            Hunk(header="@@ -1 +1,1 @@",
+                 old_start=1, old_count=1, new_start=1, new_count=1,
+                 context="",
+                 lines=[Line("+", "x")] * 300),
+        ]),
+    ])
+    wt.folded = False
+    tiny = _toy_commit(sha="t")
+    tiny.files = [
+        File(path="tiny.py", old_path=None, status="M", hunks=[
+            Hunk(header="@@ -1 +1,1 @@",
+                 old_start=1, old_count=1, new_start=1, new_count=1,
+                 context="",
+                 lines=[Line("+", "x")]),
+        ]),
+    ]
+    ui = UI([wt, tiny])
+    # The big working-tree file should be in the scaling input, so
+    # the tiny commit's bar shrinks to one char.
+    tiny_row = next(
+        r for r in ui.visible_rows()
+        if r.kind == "file" and r.item.path == "tiny.py"
+    )
+    bar_chars = "".join(
+        t for t, _ in ui._format_row(tiny_row)
+        if t and set(t) <= {"+", "-"}
+    )
+    assert len(bar_chars) == 1
 
 
 # -- multi-commit log view ---------------------------------------------

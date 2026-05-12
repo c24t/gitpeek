@@ -12,10 +12,11 @@ two distinct sentinels means we can parse the stream without ambiguity.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import List
 
-from gitpeek.diff import Commit, File, Message, parse_diff
+from gitpeek.diff import Commit, File, Hunk, Line, Message, parse_diff
 
 
 # Field separator *inside* a single commit's log record. We spell it as
@@ -145,6 +146,127 @@ def load_diff(sha: str, cwd: str | None = None) -> List[File]:
         cwd=cwd,
     )
     return parse_diff(patch)
+
+
+def load_uncommitted(cwd: str | None = None) -> Commit | None:
+    """Build a synthetic commit for everything not yet committed.
+
+    Combines two sources so the user sees the same surface area as
+    ``git status``:
+
+    * ``git diff HEAD`` — modifications, deletions, renames, and
+      staged-as-added content for tracked files.
+    * ``git ls-files --others --exclude-standard`` — untracked
+      non-ignored files. Each one is synthesised into a "new file"
+      diff (status ``A``, all body lines as additions) so the renderer
+      doesn't need a special case for untracked.
+
+    Returns ``None`` when both sources are empty, so callers can skip
+    prepending an empty section to the log view. Doesn't reach for
+    ``GitError`` on a freshly-init'd repo without HEAD — the
+    ``git diff HEAD`` call fails silently and we fall through to the
+    untracked-files pass alone.
+    """
+
+    ensure_repo(cwd)
+
+    files: list[File] = []
+    try:
+        patch = _run(
+            ["diff", "HEAD", "--no-color", "--patch", "-U3"],
+            cwd=cwd,
+        )
+        files.extend(parse_diff(patch))
+    except GitError:
+        # Empty repo (no HEAD) or other transient failure — keep
+        # going so untracked files still surface.
+        pass
+    files.extend(_synthesise_untracked_files(cwd))
+
+    if not files:
+        return None
+    return Commit(
+        sha="",
+        short_sha="working tree",
+        author="",
+        date="",
+        subject="Uncommitted changes",
+        message=Message(body=""),
+        files=files,
+        folded=True,
+        _loaded=True,
+        is_working_tree=True,
+    )
+
+
+def _synthesise_untracked_files(cwd: str | None) -> list[File]:
+    """Construct ``File`` entries for untracked, non-ignored files.
+
+    Each untracked file becomes an addition-only diff so it slots
+    into the existing render path without special-casing. Files we
+    can't UTF-8 decode are tagged ``binary`` and shown without hunks
+    — same as ``git diff`` would for binary content. Unreadable
+    files (permission denied, race-deleted) are silently dropped.
+    """
+
+    try:
+        raw = _run(
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=cwd,
+        )
+    except GitError:
+        return []
+    if not raw:
+        return []
+
+    files: list[File] = []
+    base = cwd if cwd is not None else os.getcwd()
+    for path in raw.rstrip("\x00").split("\x00"):
+        if not path:
+            continue
+        full = os.path.join(base, path)
+        try:
+            with open(full, "rb") as fh:
+                blob = fh.read()
+        except OSError:
+            # Disappeared between the ls-files call and now, or no
+            # permission — pretend it doesn't exist.
+            continue
+        try:
+            content = blob.decode("utf-8")
+        except UnicodeDecodeError:
+            files.append(
+                File(
+                    path=path,
+                    old_path=None,
+                    status="A",
+                    hunks=[],
+                    binary=True,
+                )
+            )
+            continue
+        body_lines = content.splitlines()
+        if not body_lines:
+            # Empty file — show the entry but skip the hunk so the
+            # counts read as zero. Same shape as ``git diff`` of an
+            # empty new file.
+            files.append(
+                File(path=path, old_path=None, status="A", hunks=[])
+            )
+            continue
+        hunk = Hunk(
+            header=f"@@ -0,0 +1,{len(body_lines)} @@",
+            old_start=0,
+            old_count=0,
+            new_start=1,
+            new_count=len(body_lines),
+            context="",
+            lines=[Line("+", text=line) for line in body_lines],
+        )
+        files.append(
+            File(path=path, old_path=None, status="A", hunks=[hunk])
+        )
+    return files
 
 
 def load_commit(ref: str = "HEAD", cwd: str | None = None) -> Commit:

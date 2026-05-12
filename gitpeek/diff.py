@@ -143,6 +143,12 @@ class Commit:
     # decide whether to show the ``(N files)`` suffix on the commit
     # row (showing ``(0 files)`` before loading would be a lie).
     _loaded: bool = False
+    # ``True`` for the synthetic "uncommitted changes" entry that
+    # gitpeek prepends to the log view. The dataclass otherwise looks
+    # like a real commit (so the UI can treat it uniformly) but with
+    # empty ``sha`` / ``author`` / ``date`` and a fixed subject; the
+    # flag lets format_row swap to a working-tree-specific row layout.
+    is_working_tree: bool = False
 
 
 def parse_diff(text: str) -> list[File]:

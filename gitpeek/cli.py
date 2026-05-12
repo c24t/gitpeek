@@ -18,7 +18,7 @@ import argparse
 import sys
 
 from gitpeek import __version__
-from gitpeek.git import GitError, load_log
+from gitpeek.git import GitError, load_log, load_uncommitted
 from gitpeek.ui import run as run_ui
 
 
@@ -70,6 +70,17 @@ def main(argv: list[str] | None = None) -> int:
     except GitError as exc:
         print(f"gitpeek: {exc}", file=sys.stderr)
         return 2
+
+    # Prepend a synthetic "uncommitted changes" entry — same shape as
+    # a commit, but flagged so the UI shows it as a working-tree
+    # section rather than a real revision. We silently skip on errors
+    # so a misbehaving working-tree scan can't block the log view.
+    try:
+        wt = load_uncommitted(cwd=args.cwd)
+    except GitError:
+        wt = None
+    if wt is not None:
+        commits.insert(0, wt)
 
     if not commits:
         print(f"gitpeek: no commits reachable from {args.ref}", file=sys.stderr)
