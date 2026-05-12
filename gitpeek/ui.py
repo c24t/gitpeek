@@ -263,26 +263,40 @@ class UI:
                 nodes.append(item)
         return nodes
 
-    def _fold_tree(self, folded: bool) -> None:
-        """Set fold state on every File and Hunk in the commit.
+    def _fold_tree(
+        self, folded: bool, scope_commit: Commit | None = None
+    ) -> None:
+        """Set fold state on a tree-wide or single-commit scope.
 
-        Used by ``zM`` / ``zR``. We deliberately *don't* fold the commit
-        row itself — that's the one row whose presence is load-bearing
-        for orientation (it tells you which commit you're looking at).
-        Folding it would just give you a one-row screen of "press l to
-        get started", which is hostile rather than helpful.
+        Used by ``zM`` / ``zR``. The scope follows the cursor:
+
+        * ``scope_commit is None`` — every commit in the log, plus
+          their messages, files, and hunks. The commit rows themselves
+          are also toggled, so ``zM`` collapses the whole tree to a
+          one-row-per-commit log view.
+        * ``scope_commit is c`` — only ``c``'s subtree. The commit row
+          stays unfolded because the cursor is sitting inside it; if
+          we folded it the cursor would land in limbo.
         """
 
-        for commit in self.commits:
+        if scope_commit is None:
+            targets = self.commits
+            touch_commit_flag = True
+        else:
+            targets = [scope_commit]
+            touch_commit_flag = False
+
+        for commit in targets:
             if not folded:
                 # ``zR`` means "open everything." For commits we
                 # haven't seen yet, that requires fetching the diff so
                 # the unfold has something to reveal. Loading every
-                # commit is the user's explicit ask — they pressed the
-                # "give me all the things" key — and they can ``zM``
-                # back if it turns out to be too much.
+                # commit in scope is the user's explicit ask — they
+                # pressed the "give me all the things" key — and they
+                # can ``zM`` back if it turns out to be too much.
                 self._ensure_loaded(commit)
-            commit.folded = folded
+            if touch_commit_flag:
+                commit.folded = folded
             if commit.message.lines:
                 commit.message.folded = folded
             for f in commit.files:
@@ -346,10 +360,46 @@ class UI:
         # match or no match.
         if self._pending_z:
             self._pending_z = False
+            # The cursor's row decides the scope: on a commit row,
+            # ``z<x>`` spans every commit (the "everything" gesture);
+            # on any indented row, it stays inside the commit the
+            # cursor is currently inside. ``visible_rows`` always
+            # leaves the cursor on a valid row, so ``rows[cursor]``
+            # is safe to read here even before the fold modifies the
+            # list.
+            rows = self.visible_rows()
+            row = rows[self.cursor]
             if ch == ord("M"):
-                self._fold_tree(True)
+                if row.kind == "commit":
+                    self._fold_tree(True)
+                else:
+                    # Collapsing inside a commit makes the cursor's
+                    # current row (file/hunk/line/message_line)
+                    # disappear. Land on the parent commit row so the
+                    # user stays oriented at the smallest still-visible
+                    # ancestor.
+                    commit = row.parent_commit
+                    self._fold_tree(True, scope_commit=commit)
+                    if commit is not None:
+                        new_rows = self.visible_rows()
+                        for i, r in enumerate(new_rows):
+                            if r.kind == "commit" and r.item is commit:
+                                self.cursor = i
+                                break
             elif ch == ord("R"):
-                self._fold_tree(False)
+                cursor_item = row.item
+                if row.kind == "commit":
+                    self._fold_tree(False)
+                else:
+                    self._fold_tree(False, scope_commit=row.parent_commit)
+                # zR only *adds* rows around the cursor; identity-
+                # track the original cursor item so its index follows
+                # the new row positions.
+                new_rows = self.visible_rows()
+                for i, r in enumerate(new_rows):
+                    if r.item is cursor_item:
+                        self.cursor = i
+                        break
             # Unknown ``z<x>`` — swallow silently rather than letting
             # the second key double as both "cancel the prefix" and
             # its own action. Same as vim.
@@ -724,8 +774,9 @@ class UI:
             "    f               fold / unfold current item",
             "    F               fold current + all ancestors",
             "    *               toggle subtree (open all if any closed)",
-            "    zM              fold every file and hunk",
-            "    zR              unfold every file and hunk",
+            "    zM              fold; on a commit row affects every",
+            "                    commit, otherwise just the current one",
+            "    zR              unfold; same scope rules as zM",
             "",
             "  Other",
             "    ?               toggle this help",

@@ -390,14 +390,100 @@ def test_J_jumps_between_commits_in_log_view() -> None:
 
 def test_zM_collapses_all_commits_in_log() -> None:
     commits = [_toy_commit(sha="a"), _toy_commit(sha="b")]
-    # ``_toy_commit`` opens its own commit; zM should still collapse
-    # everything down to one row per commit.
+    # ``_toy_commit`` opens its own commit; zM with the cursor on a
+    # commit row should collapse everything down to one row per
+    # commit.
     ui = UI(commits)
     ui._handle_key(ord("z"))
     ui._handle_key(ord("M"))
     kinds = [r.kind for r in ui.visible_rows()]
     assert kinds == ["commit", "commit"]
     assert all(c.folded for c in ui.commits)
+
+
+def test_zM_on_indented_row_is_scoped_to_current_commit() -> None:
+    """``zM`` from a hunk should fold only that commit's subtree.
+
+    Other commits' fold state is left untouched, and the cursor lands
+    on the parent commit row since the hunk it was sitting on is now
+    hidden by the collapsed file."""
+    a = _toy_commit(sha="a")
+    b = _toy_commit(sha="b")
+    ui = UI([a, b])
+    # ``UI.__init__`` re-folds every file/hunk, so we have to open
+    # them again *after* construction to set up the "everything
+    # unfolded across two commits" scenario.
+    for c in (a, b):
+        for f in c.files:
+            f.folded = False
+            for h in f.hunks:
+                h.folded = False
+    ui._invalidate()
+    # Drive the cursor onto the first hunk under commit ``a``.
+    rows = ui.visible_rows()
+    hunk_idx = next(i for i, r in enumerate(rows) if r.kind == "hunk")
+    ui.cursor = hunk_idx
+    ui._handle_key(ord("z"))
+    ui._handle_key(ord("M"))
+    # Commit ``a`` had its files/hunks folded; commit row stayed open
+    # because the cursor was sitting inside it.
+    assert a.folded is False
+    assert all(f.folded for f in a.files)
+    assert all(h.folded for f in a.files for h in f.hunks)
+    # Commit ``b`` is completely untouched.
+    assert b.folded is False
+    assert b.files[0].folded is False
+    assert b.files[0].hunks[0].folded is False
+    assert b.files[1].folded is False
+    # Cursor landed on commit ``a``'s row.
+    assert ui.visible_rows()[ui.cursor].kind == "commit"
+    assert ui.visible_rows()[ui.cursor].item is a
+
+
+def test_zR_on_indented_row_unfolds_only_current_commit() -> None:
+    """``zR`` from inside one commit shouldn't drag others open."""
+    a = _stub_metadata_commit("a")
+    b = _stub_metadata_commit("b")
+    # Pre-load and pre-open commit ``a`` so we can put the cursor on a
+    # file row inside it, but leave ``b`` collapsed and unloaded.
+    a.files = _toy_commit().files
+    a._loaded = True
+    a.folded = False
+    ui = UI([a, b])
+    rows = ui.visible_rows()
+    file_idx = next(i for i, r in enumerate(rows) if r.kind == "file")
+    ui.cursor = file_idx
+    ui._handle_key(ord("z"))
+    ui._handle_key(ord("R"))
+    # Inside commit ``a`` everything is open now.
+    for f in a.files:
+        assert f.folded is False
+        for h in f.hunks:
+            assert h.folded is False
+    # Commit ``b`` was never loaded and never unfolded.
+    assert b._loaded is False
+    assert b.folded is True
+
+
+def test_zR_on_indented_row_keeps_cursor_on_same_item() -> None:
+    """Identity-tracking: the cursor should follow the same row item
+
+    after ``zR`` even though new rows are inserted above and below it."""
+    c = _toy_commit(body="hi")
+    ui = UI([c])
+    # Drop the cursor onto the second file (which is still folded), so
+    # there's only one row between it and the commit row.
+    rows = ui.visible_rows()
+    second_file_idx = [i for i, r in enumerate(rows) if r.kind == "file"][1]
+    ui.cursor = second_file_idx
+    second_file = rows[second_file_idx].item
+    ui._handle_key(ord("z"))
+    ui._handle_key(ord("R"))
+    # After zR, the message row and the first file's hunks (and lines)
+    # are now visible above us — the cursor index *must* have shifted
+    # to compensate, but the actual file object under the cursor
+    # should be the same.
+    assert ui.visible_rows()[ui.cursor].item is second_file
 
 
 # -- stat bar ----------------------------------------------------------
