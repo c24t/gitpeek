@@ -272,6 +272,217 @@ def test_ctrl_d_has_one_row_minimum_on_tiny_terminals() -> None:
     assert ui.cursor == 1
 
 
+# -- Enter / vim launch -------------------------------------------------
+
+
+def _file_row(ui: UI, path: str) -> "object":
+    """Drill into the toy commit's files and return the row for ``path``."""
+    return next(
+        r for r in ui.visible_rows() if r.kind == "file" and r.item.path == path
+    )
+
+
+def _unfolded_line_rows(ui: UI) -> list:
+    """Return the visible ``line`` rows from a.py's first hunk."""
+    a = ui.commits[0].files[0]
+    a.folded = False
+    a.hunks[0].folded = False
+    ui._invalidate()
+    return [r for r in ui.visible_rows() if r.kind == "line"]
+
+
+def test_compute_line_target_on_context_line_returns_post_image_lineno() -> None:
+    """A space-prefixed (context) line should map straight to its post
+
+    image line number — both old and new sides have the same content."""
+    ui = UI([_toy_commit()])
+    line_rows = _unfolded_line_rows(ui)
+    # Hunk 1 layout: [' x', '-y', '+z'], new_start=1.
+    context_row = line_rows[0]
+    assert context_row.item.kind == " "
+    assert ui._compute_line_target(context_row) == 1
+
+
+def test_compute_line_target_on_addition_returns_its_own_lineno() -> None:
+    """A ``+`` line should report the line *it* occupies in the post
+
+    image, not the line that follows it."""
+    ui = UI([_toy_commit()])
+    line_rows = _unfolded_line_rows(ui)
+    plus_row = line_rows[2]
+    assert plus_row.item.kind == "+"
+    # ' x' → new line 1; '-y' contributes nothing to the new side;
+    # '+z' → new line 2.
+    assert ui._compute_line_target(plus_row) == 2
+
+
+def test_compute_line_target_on_removal_points_to_replacing_line() -> None:
+    """A ``-`` line doesn't exist in the post image; the cursor
+
+    should land on the line that follows it (the one that "took its
+    place" in the post image)."""
+    ui = UI([_toy_commit()])
+    line_rows = _unfolded_line_rows(ui)
+    minus_row = line_rows[1]
+    assert minus_row.item.kind == "-"
+    # '-y' would have been line 2 in the old file; on the new side
+    # that slot is occupied by '+z'. Cursor lands on the replacing
+    # line — also line 2.
+    assert ui._compute_line_target(minus_row) == 2
+
+
+def test_build_vim_args_for_real_commit_file_row() -> None:
+    """File row → ``Gedit SHA:path`` + ``Gvdiffsplit SHA^`` + line 1."""
+    ui = UI([_toy_commit(sha="a")])
+    row = _file_row(ui, "a.py")
+    args = ui._build_vim_args(row)
+    assert args == [
+        "vim",
+        "-c", "Gedit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:a.py",
+        "-c", "Gvdiffsplit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa^",
+        "-c", "1",
+    ]
+
+
+def test_build_vim_args_for_working_tree_file_row() -> None:
+    """Working tree → ``edit path`` + ``Gvdiffsplit HEAD`` + line 1."""
+    wt = _toy_working_tree(files=_toy_commit().files)
+    wt.folded = False
+    ui = UI([wt])
+    row = _file_row(ui, "a.py")
+    args = ui._build_vim_args(row)
+    assert args == [
+        "vim",
+        "-c", "edit a.py",
+        "-c", "Gvdiffsplit HEAD",
+        "-c", "1",
+    ]
+
+
+def test_build_vim_args_uses_hunk_new_start_for_hunk_row() -> None:
+    """A hunk row should jump the cursor to the hunk's post-image start."""
+    ui = UI([_toy_commit(sha="b")])
+    ui._handle_key(ord("j"))
+    ui._handle_key(ord("l"))   # unfold a.py
+    ui._handle_key(ord("J"))   # jump to second hunk header (new_start=10)
+    ui._handle_key(ord("J"))   # actually next file's hunk... go simpler:
+    # Reset: navigate to a.py's *second* hunk explicitly.
+    ui = UI([_toy_commit(sha="b")])
+    rows = ui.visible_rows()
+    # Manually unfold a.py.
+    a = ui.commits[0].files[0]
+    a.folded = False
+    ui._invalidate()
+    second_hunk_row = [
+        r for r in ui.visible_rows()
+        if r.kind == "hunk" and r.parent_file is a
+    ][1]
+    args = ui._build_vim_args(second_hunk_row)
+    assert args is not None
+    assert args[-1] == "10"
+
+
+def test_build_vim_args_handles_renames_via_old_path_on_pre_side() -> None:
+    """For a rename, the pre-image side should reference the old path."""
+    c = _toy_commit(sha="c")
+    c.files = [
+        File(path="new.py", old_path="old.py", status="R", hunks=[
+            Hunk(header="@@ -1,1 +1,1 @@",
+                 old_start=1, old_count=1, new_start=1, new_count=1,
+                 context="",
+                 lines=[Line("-", "old"), Line("+", "new")]),
+        ]),
+    ]
+    ui = UI([c])
+    row = _file_row(ui, "new.py")
+    args = ui._build_vim_args(row)
+    assert args is not None
+    # The Gvdiffsplit target carries the old path so fugitive can find
+    # the file in the pre-image rev (where it had a different name).
+    assert "Gvdiffsplit cccccccccccccccccccccccccccccccccccccccc^:old.py" in args
+
+
+def test_build_vim_args_for_deletion_skips_the_diff_split() -> None:
+    """A deletion has no post-image — open the parent's version and bail.
+
+    No ``Gvdiffsplit`` (nothing to diff against)."""
+    c = _toy_commit(sha="d")
+    c.files = [
+        File(path="goner.py", old_path=None, status="D", hunks=[
+            Hunk(header="@@ -1,2 +0,0 @@",
+                 old_start=1, old_count=2, new_start=0, new_count=0,
+                 context="",
+                 lines=[Line("-", "a"), Line("-", "b")]),
+        ]),
+    ]
+    ui = UI([c])
+    row = _file_row(ui, "goner.py")
+    args = ui._build_vim_args(row)
+    assert args is not None
+    assert not any("Gvdiffsplit" in a for a in args)
+    assert "Gedit dddddddddddddddddddddddddddddddddddddddd^:goner.py" in args
+
+
+def test_build_vim_args_returns_none_for_unopenable_rows() -> None:
+    """Commit rows, message rows, and binary files have no vim target."""
+    c = _toy_commit(body="hello", sha="e")
+    c.files = [
+        File(path="logo.png", old_path=None, status="B", hunks=[], binary=True),
+    ]
+    ui = UI([c])
+    rows = ui.visible_rows()
+    commit_row = next(r for r in rows if r.kind == "commit")
+    message_row = next(r for r in rows if r.kind == "message")
+    binary_row = next(r for r in rows if r.kind == "file")
+    assert ui._build_vim_args(commit_row) is None
+    assert ui._build_vim_args(message_row) is None
+    assert ui._build_vim_args(binary_row) is None
+
+
+def test_enter_on_file_row_invokes_subprocess(monkeypatch) -> None:
+    """Pressing Enter on a file row should call ``subprocess.run``
+
+    with the vim argv we built. We monkeypatch ``subprocess.run`` so
+    the test doesn't actually spawn vim, and ``curses.endwin`` plus
+    the stdscr refresh path so the launcher's suspend/resume dance
+    doesn't choke on a missing screen."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+
+    monkeypatch.setattr(ui_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(ui_module.curses, "endwin", lambda: None)
+
+    class _FakeScr:
+        def clear(self):
+            pass
+
+        def refresh(self):
+            pass
+
+    ui = UI([_toy_commit(sha="f")])
+    ui._stdscr = _FakeScr()
+    ui._handle_key(ord("j"))   # → file row
+    ui._handle_key(10)         # Enter (LF)
+    assert len(calls) == 1
+    assert calls[0][0] == "vim"
+    assert "Gedit ffffffffffffffffffffffffffffffffffffffff:a.py" in calls[0]
+
+
+def test_enter_on_commit_row_is_a_noop(monkeypatch) -> None:
+    """Enter on a commit header shouldn't fire the launcher at all."""
+    called: list[bool] = []
+    monkeypatch.setattr(
+        ui_module.subprocess, "run", lambda *a, **k: called.append(True)
+    )
+    monkeypatch.setattr(ui_module.curses, "endwin", lambda: None)
+    ui = UI([_toy_commit()])
+    ui._stdscr = object()   # any non-None object; we won't refresh
+    ui._handle_key(10)      # Enter on commit row
+    assert called == []
+
+
 # -- zR / zM / * --------------------------------------------------------
 
 

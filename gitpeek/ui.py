@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import curses
 import locale
+import subprocess
 from dataclasses import dataclass
 from typing import Any
 
@@ -100,6 +101,13 @@ class Row:
     depth: int
     kind: str  # 'commit' | 'message' | 'message_line' | 'file' | 'hunk' | 'line'
     parent_commit: Commit | None = None
+    # Set on rows that live inside a file (``hunk`` and ``line``); used
+    # by the ``Enter`` handler to find the file path to open in vim.
+    parent_file: File | None = None
+    # Set on ``line`` rows only; used to compute the post-image line
+    # number for cursor placement, which depends on walking the line's
+    # containing hunk.
+    parent_hunk: Hunk | None = None
 
 
 class UI:
@@ -138,6 +146,10 @@ class UI:
         # first keypress before any render still does something
         # useful instead of jumping by zero.
         self._last_content_h = 20
+        # Filled in by :meth:`run` once curses hands us a screen.
+        # ``Enter`` needs it so the vim launch can call
+        # ``curses.endwin()`` and re-paint afterwards.
+        self._stdscr: "curses.window | None" = None
         # Widths used to align the stat bar across visible file rows.
         # Recomputed every time the visible-rows list is rebuilt so the
         # left edge of every bar lines up at one column — same idea as
@@ -194,10 +206,21 @@ class UI:
                 rows.append(Row(f, 1, "file", parent_commit=commit))
                 if not f.folded:
                     for h in f.hunks:
-                        rows.append(Row(h, 2, "hunk", parent_commit=commit))
+                        rows.append(
+                            Row(h, 2, "hunk", parent_commit=commit, parent_file=f)
+                        )
                         if not h.folded:
                             for ln in h.lines:
-                                rows.append(Row(ln, 3, "line", parent_commit=commit))
+                                rows.append(
+                                    Row(
+                                        ln,
+                                        3,
+                                        "line",
+                                        parent_commit=commit,
+                                        parent_file=f,
+                                        parent_hunk=h,
+                                    )
+                                )
         self._recompute_file_row_widths(rows)
         self._cached_rows = rows
         return rows
@@ -328,6 +351,137 @@ class UI:
                 nodes.append(item)
         return nodes
 
+    def _compute_line_target(self, row: Row) -> int:
+        """Return the post-image line number for a ``line`` row.
+
+        We walk the parent hunk, tracking the new-side counter. The
+        rules:
+
+        * For ``" "`` (context) and ``"+"`` (addition) lines, return
+          the counter as-is — these lines occupy ``new_lineno`` in
+          the post-image.
+        * For ``"-"`` (removal) lines, also return the current
+          counter — they don't exist in the post-image, so the
+          natural place to land the cursor is the line that "took
+          their place" (the next post-image line).
+
+        Falls back to ``1`` when there's no parent hunk (shouldn't
+        happen via the normal row builder, but defensive).
+        """
+
+        hunk = row.parent_hunk
+        if hunk is None:
+            return 1
+        new_lineno = max(1, hunk.new_start)
+        for ln in hunk.lines:
+            if ln is row.item:
+                return new_lineno
+            if ln.kind in (" ", "+"):
+                new_lineno += 1
+        # Hit the end without finding the line — return whatever we
+        # tracked. Visible rows always come from the same hunk so we
+        # shouldn't reach this in practice.
+        return new_lineno
+
+    def _build_vim_args(self, row: Row) -> list[str] | None:
+        """Compose the ``vim`` argv to open ``row`` with a fugitive diff.
+
+        Returns ``None`` for rows where "open in vim" doesn't make
+        sense — commit headers, message rows, binary files. Branches
+        on whether the cursor is in the working-tree section or a
+        real commit, and on the file's status (deletion, rename,
+        regular modify/add).
+        """
+
+        if row.kind not in ("file", "hunk", "line"):
+            return None
+        f = row.item if row.kind == "file" else row.parent_file
+        commit = row.parent_commit
+        if f is None or commit is None or f.binary:
+            return None
+
+        if row.kind == "file":
+            line = 1
+        elif row.kind == "hunk":
+            # Hunks with a zero ``new_start`` (pure-deletion hunks)
+            # still need a sensible cursor target on the post-image
+            # side; clamp to 1.
+            line = max(1, row.item.new_start)
+        else:
+            line = self._compute_line_target(row)
+
+        if commit.is_working_tree:
+            return self._wt_vim_args(f, line)
+        return self._rev_vim_args(commit, f, line)
+
+    def _wt_vim_args(self, f: File, line: int) -> list[str]:
+        """Vim argv for a working-tree file.
+
+        The working tree IS the post-image, so we open it directly
+        and diff against HEAD. Renamed files reference the old path
+        on the HEAD side. Pure deletions don't exist in the working
+        tree, so we open the HEAD version with no diff split — same
+        idiom git itself uses (``git show HEAD:path`` for a deleted
+        file).
+        """
+
+        if f.status == "D":
+            return ["vim", "-c", f"Gedit HEAD:{f.path}", "-c", str(line)]
+        diff_target = "HEAD"
+        if f.old_path and f.old_path != f.path:
+            diff_target = f"HEAD:{f.old_path}"
+        return [
+            "vim",
+            "-c", f"edit {f.path}",
+            "-c", f"Gvdiffsplit {diff_target}",
+            "-c", str(line),
+        ]
+
+    def _rev_vim_args(
+        self, commit: Commit, f: File, line: int
+    ) -> list[str]:
+        """Vim argv for a file in a real commit.
+
+        Loads the file at the commit (post-image) via ``:Gedit``,
+        then opens a vertical fugitive diff against the parent
+        commit (pre-image). Renames point the pre-image at the old
+        path. Deletions skip the diff split because the file has no
+        post-image to diff *to*.
+        """
+
+        if f.status == "D":
+            return [
+                "vim",
+                "-c", f"Gedit {commit.sha}^:{f.path}",
+                "-c", str(line),
+            ]
+        diff_target = f"{commit.sha}^"
+        if f.old_path and f.old_path != f.path:
+            diff_target = f"{commit.sha}^:{f.old_path}"
+        return [
+            "vim",
+            "-c", f"Gedit {commit.sha}:{f.path}",
+            "-c", f"Gvdiffsplit {diff_target}",
+            "-c", str(line),
+        ]
+
+    def _launch_vim(self, row: Row) -> None:
+        """Suspend curses, run vim against the row's target, then redraw."""
+
+        args = self._build_vim_args(row)
+        if args is None or self._stdscr is None:
+            return
+        curses.endwin()
+        try:
+            subprocess.run(args, cwd=self.cwd)
+        except FileNotFoundError:
+            # ``vim`` isn't on PATH. Silently swallow — the redraw
+            # below restores the gitpeek screen so the user lands
+            # back where they were instead of getting a traceback.
+            pass
+        self._stdscr.clear()
+        self._stdscr.refresh()
+
     def _toggle_fold(self, row: Row) -> None:
         """Flip the fold flag on ``row``'s item, lazy-loading if needed.
 
@@ -395,6 +549,10 @@ class UI:
 
     def run(self, stdscr: "curses.window") -> None:
         """Main event loop. Called by :func:`curses.wrapper`."""
+
+        # Stashed so ``Enter`` can suspend / resume the screen around
+        # an external ``vim`` invocation.
+        self._stdscr = stdscr
 
         curses.curs_set(0)
         # Honour the terminal's existing palette where possible — looks
@@ -518,6 +676,12 @@ class UI:
         elif ch == _CTRL_U:
             step = max(1, self._last_content_h // 2)
             self.cursor = max(self.cursor - step, 0)
+
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            # Hand off to vim with a fugitive diff against the prior
+            # revision. No-op on rows that don't have a meaningful
+            # target (commit headers, message rows, binary files).
+            self._launch_vim(row)
 
         elif ch in (ord("l"), curses.KEY_RIGHT):
             # crecord semantics: if the current node is folded, unfold
@@ -902,6 +1066,8 @@ class UI:
             "    zR              unfold; same scope rules as zM",
             "",
             "  Other",
+            "    ENTER           open file in vim with a fugitive diff",
+            "                    against the previous revision",
             "    ?               toggle this help",
             "    q / Q           quit",
             "",
