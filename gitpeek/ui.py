@@ -54,19 +54,45 @@ _GLYPH_OPEN = "▼"
 _GLYPH_CLOSED = "▶"
 
 
+# Max width of the ``git --stat``-style bar (``+++--``) after each
+# file row. Sixteen characters keeps the bar visible on the typical
+# 80-column terminal without crowding out long path names.
+_STAT_BAR_WIDTH = 16
+
+
+def _cp(n: int) -> int:
+    """``curses.color_pair`` that's safe to call before ``initscr``.
+
+    Outside :func:`curses.wrapper` (i.e., in unit tests that drive the
+    formatting code directly) ``curses.color_pair`` raises because no
+    color table has been initialised. Return zero — the terminal's
+    default attribute — so the row-formatting logic stays exercisable
+    without spinning up a real screen.
+    """
+
+    try:
+        return curses.color_pair(n)
+    except curses.error:
+        return 0
+
+
 @dataclass
 class Row:
     """One renderable line in the flattened tree view.
 
-    ``item`` is the underlying ``Commit`` / ``File`` / ``Hunk`` / ``Line``
-    node; ``depth`` is its nesting level (used both for indentation and
-    for "jump to parent"); ``kind`` is a short string used by the
-    "next/prev of same kind" navigation.
+    ``item`` is the underlying ``Commit`` / ``Message`` / ``File`` /
+    ``Hunk`` / ``Line`` node; ``depth`` is its nesting level (used both
+    for indentation and for "jump to parent"); ``kind`` is a short
+    string used by the "next/prev of same kind" navigation;
+    ``parent_commit`` is the enclosing :class:`Commit` for every non-
+    commit row (and ``None`` for commit rows themselves), so the UI
+    can answer "which commit am I in?" without walking the row list.
     """
 
     item: Any
     depth: int
-    kind: str  # 'commit' | 'file' | 'hunk' | 'line'
+    kind: str  # 'commit' | 'message' | 'message_line' | 'file' | 'hunk' | 'line'
+    parent_commit: Commit | None = None
 
 
 class UI:
@@ -134,18 +160,18 @@ class UI:
             # as a ``git log -p`` page.
             msg = commit.message
             if msg.lines:
-                rows.append(Row(msg, 1, "message"))
+                rows.append(Row(msg, 1, "message", parent_commit=commit))
                 if not msg.folded:
                     for line in msg.lines:
-                        rows.append(Row(line, 2, "message_line"))
+                        rows.append(Row(line, 2, "message_line", parent_commit=commit))
             for f in commit.files:
-                rows.append(Row(f, 1, "file"))
+                rows.append(Row(f, 1, "file", parent_commit=commit))
                 if not f.folded:
                     for h in f.hunks:
-                        rows.append(Row(h, 2, "hunk"))
+                        rows.append(Row(h, 2, "hunk", parent_commit=commit))
                         if not h.folded:
                             for ln in h.lines:
-                                rows.append(Row(ln, 3, "line"))
+                                rows.append(Row(ln, 3, "line", parent_commit=commit))
         self._cached_rows = rows
         return rows
 
@@ -514,7 +540,7 @@ class UI:
         stdscr.refresh()
 
     def _draw_status_bar(self, stdscr: "curses.window", w: int) -> None:
-        attr = curses.color_pair(_CP_STATUS) | curses.A_BOLD
+        attr = _cp(_CP_STATUS) | curses.A_BOLD
         line1 = (
             "VIEW COMMIT: (j/k/↓/↑) move; (l/h/→/←) open/close; "
             "(f)old (F)old-all; (J/K) jump same-kind"
@@ -532,20 +558,60 @@ class UI:
         row: Row,
         selected: bool,
     ) -> None:
-        text, attr = self._format_row(row)
-        if selected:
-            attr |= curses.A_REVERSE
-        # Pad so the reverse-video cursor highlight extends across the
-        # whole line, not just the text — same trick crecord uses.
-        padded = text.ljust(w)
-        try:
-            stdscr.addnstr(y, 0, padded, w - 1, attr)
-        except curses.error:
-            # Curses raises on the bottom-right cell; nothing we can do
-            # about it and it's harmless.
-            pass
+        # Each row is rendered as one or more (text, color-attr)
+        # segments so we can put green ``+`` chars and red ``-`` chars
+        # on the same line as the yellow file header — same idiom as
+        # ``git diff --stat`` in a color terminal. Most row kinds
+        # return a single segment.
+        segments = self._format_row(row)
+        base = curses.A_REVERSE if selected else 0
+        x = 0
+        for text, attr in segments:
+            if x >= w - 1:
+                break
+            avail = w - 1 - x
+            clipped = text[:avail]
+            try:
+                stdscr.addnstr(y, x, clipped, avail, attr | base)
+            except curses.error:
+                # Curses raises on the bottom-right cell; nothing we
+                # can do about it and it's harmless.
+                pass
+            x += len(clipped)
+        # Pad the rest of the line with the base attribute so the
+        # reverse-video cursor highlight extends across the whole row,
+        # not just the text — same trick crecord uses.
+        if x < w - 1 and base:
+            try:
+                stdscr.addnstr(y, x, " " * (w - 1 - x), w - 1 - x, base)
+            except curses.error:
+                pass
 
-    def _format_row(self, row: Row) -> tuple[str, int]:
+    def _stat_bar_widths(
+        self, f: File, max_total: int, width: int = _STAT_BAR_WIDTH
+    ) -> tuple[int, int]:
+        """Compute ``(n_plus, n_minus)`` for ``f``'s stat bar.
+
+        Mirrors ``git diff --stat`` scaling: when the most-changed file
+        in the commit has fewer than ``width`` total changes, every
+        file gets one character per change (1:1 mapping). Otherwise
+        all files are scaled so the most-changed file fills ``width``,
+        and any non-zero side gets at least one character so a file
+        with a single deletion doesn't visually round to "nothing
+        happened."
+        """
+
+        total = f.additions + f.deletions
+        if total == 0 or max_total == 0:
+            return 0, 0
+        if max_total <= width:
+            return f.additions, f.deletions
+        scale = width / max_total
+        adds = max(1 if f.additions else 0, round(f.additions * scale))
+        dels = max(1 if f.deletions else 0, round(f.deletions * scale))
+        return adds, dels
+
+    def _format_row(self, row: Row) -> list[tuple[str, int]]:
         indent = _INDENT * row.depth
 
         if row.kind == "commit":
@@ -568,7 +634,7 @@ class UI:
                 f"{glyph} {c.short_sha}  {date_short}  {c.subject}  "
                 f"— {c.author}{suffix}"
             )
-            return text, curses.color_pair(_CP_COMMIT) | curses.A_BOLD
+            return [(text, _cp(_CP_COMMIT) | curses.A_BOLD)]
 
         if row.kind == "message":
             msg: Message = row.item
@@ -576,7 +642,7 @@ class UI:
             n = len(msg.lines)
             word = "line" if n == 1 else "lines"
             text = f"{indent}{glyph} (commit message — {n} {word})"
-            return text, curses.color_pair(_CP_DIM) | curses.A_DIM
+            return [(text, _cp(_CP_DIM) | curses.A_DIM)]
 
         if row.kind == "message_line":
             # The two-space pad keeps the prose left-aligned with file
@@ -584,7 +650,7 @@ class UI:
             # consistent left margin regardless of which subtree it's
             # scanning.
             text = f"{indent}  {row.item}"
-            return text, curses.color_pair(_CP_DIM)
+            return [(text, _cp(_CP_DIM))]
 
         if row.kind == "file":
             f: File = row.item
@@ -593,30 +659,51 @@ class UI:
             if f.old_path and f.old_path != f.path:
                 path = f"{f.old_path} → {f.path}"
             if f.binary:
-                stats = "(binary)"
-            else:
-                stats = f"(+{f.additions} -{f.deletions})"
-            text = f"{indent}{glyph} [{f.status}] {path}  {stats}"
-            return text, curses.color_pair(_CP_FILE)
+                return [
+                    (
+                        f"{indent}{glyph} [{f.status}] {path}  (binary)",
+                        _cp(_CP_FILE),
+                    )
+                ]
+            # Header (yellow) + stat bar (green pluses + red minuses,
+            # matching ``git diff --stat`` in a color terminal). We
+            # build the bar from the parent commit's max-changes so
+            # bars across the same commit scale relative to each other.
+            header = (
+                f"{indent}{glyph} [{f.status}] {path}  "
+                f"(+{f.additions} -{f.deletions}) "
+            )
+            segments: list[tuple[str, int]] = [
+                (header, _cp(_CP_FILE)),
+            ]
+            max_total = (
+                row.parent_commit.max_file_changes if row.parent_commit else 0
+            )
+            n_add, n_del = self._stat_bar_widths(f, max_total)
+            if n_add:
+                segments.append(("+" * n_add, _cp(_CP_ADD)))
+            if n_del:
+                segments.append(("-" * n_del, _cp(_CP_DEL)))
+            return segments
 
         if row.kind == "hunk":
             hk: Hunk = row.item
             glyph = _GLYPH_CLOSED if hk.folded else _GLYPH_OPEN
             text = f"{indent}{glyph} {hk.header}"
-            return text, curses.color_pair(_CP_HUNK)
+            return [(text, _cp(_CP_HUNK))]
 
         # line
         ln: Line = row.item
         if ln.kind == "+":
-            color = curses.color_pair(_CP_ADD)
+            color = _cp(_CP_ADD)
         elif ln.kind == "-":
-            color = curses.color_pair(_CP_DEL)
+            color = _cp(_CP_DEL)
         else:
-            color = curses.color_pair(_CP_DIM)
+            color = _cp(_CP_DIM)
         # Two-space indent under the hunk header keeps the marker column
         # aligned with the hunk's glyph, which makes scanning easy.
         text = f"{indent}  {ln.kind}{ln.text}"
-        return text, color
+        return [(text, color)]
 
     def _draw_help(self, stdscr: "curses.window", h: int, w: int) -> None:
         """Overlay a help panel centered on screen."""
@@ -653,7 +740,7 @@ class UI:
             return
         y0 = (h - box_h) // 2
         x0 = (w - box_w) // 2
-        attr = curses.color_pair(_CP_STATUS)
+        attr = _cp(_CP_STATUS)
         # Box outline + filled body. We draw the corners and edges by
         # hand instead of using ``stdscr.border`` because that draws on
         # the whole screen, not on a subwindow.

@@ -400,6 +400,125 @@ def test_zM_collapses_all_commits_in_log() -> None:
     assert all(c.folded for c in ui.commits)
 
 
+# -- stat bar ----------------------------------------------------------
+
+
+def _flatten_segments(segments) -> str:
+    return "".join(text for text, _ in segments)
+
+
+def test_stat_bar_one_to_one_for_small_commits() -> None:
+    """When the largest file has fewer changes than the bar width,
+
+    each file should get exactly one bar character per change. Mirrors
+    ``git diff --stat`` behaviour for small diffs."""
+    ui = UI([_toy_commit()])
+    f = ui.commits[0].files[0]   # ``a.py`` has 2 additions, 2 deletions
+    n_add, n_del = ui._stat_bar_widths(f, max_total=4)
+    assert (n_add, n_del) == (2, 2)
+
+
+def test_stat_bar_scales_when_max_exceeds_width() -> None:
+    """A file with 100 changes in a commit whose max is 200 should fill
+
+    half the bar width, with the add/del ratio preserved."""
+    ui = UI([_toy_commit()])
+    f = File(
+        path="big.py",
+        old_path=None,
+        status="M",
+        hunks=[],
+    )
+    # Hand-rigged additions/deletions via a fake hunk so the
+    # ``additions`` / ``deletions`` properties report what we want.
+    f.hunks = [
+        Hunk(
+            header="@@ -1,1 +1,1 @@",
+            old_start=1,
+            old_count=1,
+            new_start=1,
+            new_count=1,
+            context="",
+            lines=[Line("+", "x")] * 80 + [Line("-", "y")] * 20,
+        ),
+    ]
+    n_add, n_del = ui._stat_bar_widths(f, max_total=200, width=16)
+    # 80/200 * 16 = 6.4 → 6 pluses; 20/200 * 16 = 1.6 → 2 minuses
+    assert n_add == 6
+    assert n_del == 2
+
+
+def test_stat_bar_gives_one_char_minimum_for_nonzero_side() -> None:
+    """A single deletion in a huge commit should still show as ``-``,
+
+    not vanish to zero from rounding."""
+    ui = UI([_toy_commit()])
+    f = File(path="tiny.py", old_path=None, status="M", hunks=[])
+    f.hunks = [
+        Hunk(
+            header="@@ -1 +0,0 @@",
+            old_start=1,
+            old_count=1,
+            new_start=0,
+            new_count=0,
+            context="",
+            lines=[Line("-", "x")],
+        ),
+    ]
+    # Max in the commit is 1000 — naive rounding would give 0 minuses.
+    n_add, n_del = ui._stat_bar_widths(f, max_total=1000, width=16)
+    assert n_add == 0
+    assert n_del == 1
+
+
+def test_stat_bar_empty_for_zero_change_file() -> None:
+    """A mode-only change (no +/- lines) should produce no bar."""
+    ui = UI([_toy_commit()])
+    f = File(path="modeonly.py", old_path=None, status="M", hunks=[])
+    n_add, n_del = ui._stat_bar_widths(f, max_total=5)
+    assert (n_add, n_del) == (0, 0)
+
+
+def test_file_row_renders_with_green_plus_red_minus_segments() -> None:
+    """The file row should be three segments: header, ``+``s, ``-``s.
+
+    Each ``+`` segment carries the green color pair and each ``-``
+    segment carries the red color pair, so the terminal renders the
+    bar exactly like ``git diff --stat`` would."""
+    ui = UI([_toy_commit()])
+    # Navigate to the first file row.
+    rows = ui.visible_rows()
+    file_row = next(r for r in rows if r.kind == "file")
+    segments = ui._format_row(file_row)
+    # First segment carries the file header.
+    header_text, _header_attr = segments[0]
+    assert "[M]" in header_text and "a.py" in header_text
+    # The remaining segments should be the bar characters.
+    bar_segments = segments[1:]
+    assert all(set(text) <= {"+", "-"} for text, _ in bar_segments)
+    # The flattened bar contains the right number of each.
+    bar_chars = _flatten_segments(bar_segments)
+    f = ui.commits[0].files[0]
+    assert bar_chars.count("+") == f.additions
+    assert bar_chars.count("-") == f.deletions
+
+
+def test_binary_file_row_has_no_stat_bar() -> None:
+    """Binary files should render as a single segment with ``(binary)``
+
+    and no bar — we have no add/delete count to show."""
+    c = _toy_commit()
+    c.files = [
+        File(path="logo.png", old_path=None, status="B", hunks=[], binary=True),
+    ]
+    ui = UI([c])
+    file_row = next(r for r in ui.visible_rows() if r.kind == "file")
+    segments = ui._format_row(file_row)
+    assert len(segments) == 1
+    text, _ = segments[0]
+    assert "(binary)" in text and "+" not in text and "-" not in text
+
+
 # -- lazy loading -------------------------------------------------------
 
 

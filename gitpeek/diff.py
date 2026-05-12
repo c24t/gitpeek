@@ -144,6 +144,21 @@ class Commit:
     # row (showing ``(0 files)`` before loading would be a lie).
     _loaded: bool = False
 
+    @property
+    def max_file_changes(self) -> int:
+        """The largest ``additions + deletions`` of any file in the diff.
+
+        Used by the UI to scale ``git --stat``-style bars: the most-
+        changed file in this commit gets the full bar width and the
+        rest are scaled proportionally, the same way ``git diff
+        --stat`` does it.
+        """
+
+        return max(
+            (f.additions + f.deletions for f in self.files),
+            default=0,
+        )
+
 
 def parse_diff(text: str) -> list[File]:
     """Parse a ``git show`` / ``git diff`` patch into a list of files.
