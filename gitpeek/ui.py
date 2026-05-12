@@ -26,7 +26,7 @@ import locale
 from dataclasses import dataclass
 from typing import Any
 
-from gitpeek.diff import Commit, File, Hunk, Line
+from gitpeek.diff import Commit, File, Hunk, Line, Message
 
 
 # Color pair indices. ``curses.init_pair`` uses 1-based indexing and 0
@@ -114,6 +114,15 @@ class UI:
             return self._cached_rows
         rows: list[Row] = [Row(self.commit, 0, "commit")]
         if not self.commit.folded:
+            # Message comes before files so the natural top-to-bottom
+            # order under a commit is "why" then "what" — same shape as
+            # a ``git log -p`` page.
+            msg = self.commit.message
+            if msg.lines:
+                rows.append(Row(msg, 1, "message"))
+                if not msg.folded:
+                    for line in msg.lines:
+                        rows.append(Row(line, 2, "message_line"))
             for f in self.commit.files:
                 rows.append(Row(f, 1, "file"))
                 if not f.folded:
@@ -129,7 +138,13 @@ class UI:
         """True if this row owns at least one child node."""
         item = row.item
         if isinstance(item, Commit):
-            return bool(item.files)
+            # A commit has children whenever it has either a message
+            # body or any files to show — we treat the message subtree
+            # as a first-class child so the user can open a commit that
+            # has prose but no diff (root commits, empty merges).
+            return bool(item.files) or bool(item.message.lines)
+        if isinstance(item, Message):
+            return bool(item.lines)
         if isinstance(item, File):
             return bool(item.hunks)
         if isinstance(item, Hunk):
@@ -149,15 +164,20 @@ class UI:
         item = row.item
         nodes: list = []
         if isinstance(item, Commit):
-            if not item.files:
+            if not (item.files or item.message.lines):
                 return nodes
             nodes.append(item)
+            if item.message.lines:
+                nodes.append(item.message)
             for f in item.files:
                 if f.hunks:
                     nodes.append(f)
                     for h in f.hunks:
                         if h.lines:
                             nodes.append(h)
+        elif isinstance(item, Message):
+            if item.lines:
+                nodes.append(item)
         elif isinstance(item, File):
             if not item.hunks:
                 return nodes
@@ -180,6 +200,8 @@ class UI:
         get started", which is hostile rather than helpful.
         """
 
+        if self.commit.message.lines:
+            self.commit.message.folded = folded
         for f in self.commit.files:
             if f.hunks:
                 f.folded = folded
@@ -464,6 +486,22 @@ class UI:
                 f"— {c.author}, {c.date}  ({n_files} {files_word})"
             )
             return text, curses.color_pair(_CP_COMMIT) | curses.A_BOLD
+
+        if row.kind == "message":
+            msg: Message = row.item
+            glyph = _GLYPH_CLOSED if msg.folded else _GLYPH_OPEN
+            n = len(msg.lines)
+            word = "line" if n == 1 else "lines"
+            text = f"{indent}{glyph} (commit message — {n} {word})"
+            return text, curses.color_pair(_CP_DIM) | curses.A_DIM
+
+        if row.kind == "message_line":
+            # The two-space pad keeps the prose left-aligned with file
+            # paths above and hunk bodies below, so the eye picks up a
+            # consistent left margin regardless of which subtree it's
+            # scanning.
+            text = f"{indent}  {row.item}"
+            return text, curses.color_pair(_CP_DIM)
 
         if row.kind == "file":
             f: File = row.item

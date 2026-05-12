@@ -89,6 +89,33 @@ class File:
 
 
 @dataclass
+class Message:
+    """The commit message body, presented as a foldable subtree.
+
+    The summary (subject) is shown on the commit row itself; this node
+    carries everything *after* the blank line — the prose body — so it
+    can be hidden by default and unfolded on demand. An empty body is
+    treated as "no message node at all": the UI omits the row entirely
+    rather than showing an empty placeholder.
+    """
+
+    body: str
+    folded: bool = True
+
+    @property
+    def lines(self) -> list[str]:
+        """Body split into display lines.
+
+        ``"".splitlines()`` returns ``[]``, which is exactly what we want
+        — an empty body means no children and the UI suppresses the
+        message row. Internal blank lines (``""``) are preserved so the
+        rendered prose reads the same as ``git log``.
+        """
+
+        return self.body.splitlines()
+
+
+@dataclass
 class Commit:
     """The commit being browsed (HEAD, by default)."""
 
@@ -97,7 +124,7 @@ class Commit:
     author: str
     date: str
     subject: str
-    body: str
+    message: Message
     files: list[File] = field(default_factory=list)
     # The commit node starts unfolded — that's the whole point of opening
     # the tool — but we keep the flag here so the UI's fold logic can

@@ -10,12 +10,17 @@ from __future__ import annotations
 
 import curses
 
-from gitpeek.diff import Commit, File, Hunk, Line
+from gitpeek.diff import Commit, File, Hunk, Line, Message
 from gitpeek.ui import UI
 
 
-def _toy_commit() -> Commit:
-    """Build a small commit by hand: two files, two hunks total."""
+def _toy_commit(body: str = "") -> Commit:
+    """Build a small commit by hand: two files, two hunks total.
+
+    ``body`` lets a test attach a non-empty message body without
+    re-stating the whole file/hunk skeleton; it defaults to empty so
+    the bulk of the tree-navigation tests see no message row at all.
+    """
 
     f1 = File(
         path="a.py",
@@ -64,7 +69,7 @@ def _toy_commit() -> Commit:
         author="Test <t@t>",
         date="2026-05-11",
         subject="toy",
-        body="",
+        message=Message(body=body),
         files=[f1, f2],
     )
 
@@ -275,6 +280,51 @@ def test_star_on_commit_row_toggles_whole_tree() -> None:
     # Commit itself is in the subtree, so it folds; that's fine here
     # because the user explicitly asked for "everything below me".
     assert ui.commit.folded is True
+
+
+def test_no_message_row_when_body_is_empty() -> None:
+    """Empty commit messages should not produce a placeholder row."""
+    ui = UI(_toy_commit())
+    kinds = [r.kind for r in ui.visible_rows()]
+    assert "message" not in kinds
+    # Just commit + two files at the top level.
+    assert kinds == ["commit", "file", "file"]
+
+
+def test_message_row_appears_above_files_when_body_present() -> None:
+    ui = UI(_toy_commit(body="First line of body\n\nSecond paragraph"))
+    kinds = [r.kind for r in ui.visible_rows()]
+    # Message must sit *between* the commit row and the first file row,
+    # matching the natural ``git log -p`` ordering of why-then-what.
+    assert kinds.index("message") == 1
+    assert kinds.index("message") < kinds.index("file")
+
+
+def test_message_unfolds_to_show_body_lines() -> None:
+    body = "Line one\n\nLine three"
+    ui = UI(_toy_commit(body=body))
+    ui._handle_key(ord("j"))   # cursor → message row
+    ui._handle_key(ord("l"))   # unfold it
+    rows = ui.visible_rows()
+    msg_lines = [r.item for r in rows if r.kind == "message_line"]
+    # splitlines preserves the blank line between paragraphs — the user
+    # should see the prose exactly as ``git log`` would render it.
+    assert msg_lines == ["Line one", "", "Line three"]
+
+
+def test_star_on_commit_expands_message_too() -> None:
+    """Subtree toggle on a commit row should reach into the message."""
+    ui = UI(_toy_commit(body="body line"))
+    ui._handle_key(ord("*"))
+    assert ui.commit.message.folded is False
+    assert "message_line" in [r.kind for r in ui.visible_rows()]
+
+
+def test_zR_unfolds_message_along_with_everything_else() -> None:
+    ui = UI(_toy_commit(body="hello"))
+    ui._handle_key(ord("z"))
+    ui._handle_key(ord("R"))
+    assert ui.commit.message.folded is False
 
 
 def test_star_on_leaf_line_is_noop() -> None:

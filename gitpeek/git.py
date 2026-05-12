@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import subprocess
 
-from gitpeek.diff import Commit, parse_diff
+from gitpeek.diff import Commit, Message, parse_diff
 
 
 # Field separator inside ``git log --format``. NUL is safe because git
@@ -92,6 +92,9 @@ def load_commit(ref: str = "HEAD", cwd: str | None = None) -> Commit:
         author=author,
         date=date,
         subject=subject,
-        body=body,
+        # ``%b`` emits a trailing newline for non-empty bodies, which
+        # would render as a stray blank line at the end of the prose.
+        # Strip it once here so every consumer sees the same shape.
+        message=Message(body=body.rstrip("\n")),
         files=files,
     )
