@@ -87,6 +87,13 @@ class UI:
         self.scroll = 0
         self.help_visible = False
         self._cached_rows: list[Row] | None = None
+        # vim-style ``z`` prefix: when True, the next keypress is
+        # interpreted as part of a ``z<x>`` sequence (currently ``zM``
+        # and ``zR``). Cleared on the next keystroke regardless of
+        # whether it matched a known sequence — matches vim's
+        # behaviour and means a stray arrow after ``z`` doesn't both
+        # cancel the prefix *and* move the cursor.
+        self._pending_z = False
 
     # -- model ----------------------------------------------------------
 
@@ -128,6 +135,61 @@ class UI:
         if isinstance(item, Hunk):
             return bool(item.lines)
         return False
+
+    def _collect_subtree_foldables(self, row: Row) -> list:
+        """Return all foldable nodes in the subtree rooted at ``row``.
+
+        Walks the *model* (not the visible-rows list), so it sees
+        descendants regardless of their current fold state — that's
+        what lets ``*`` reach into a collapsed file and flip its hidden
+        hunks in one keystroke. The root node is included when it has
+        children; leaves (Line) and empty branches are skipped.
+        """
+
+        item = row.item
+        nodes: list = []
+        if isinstance(item, Commit):
+            if not item.files:
+                return nodes
+            nodes.append(item)
+            for f in item.files:
+                if f.hunks:
+                    nodes.append(f)
+                    for h in f.hunks:
+                        if h.lines:
+                            nodes.append(h)
+        elif isinstance(item, File):
+            if not item.hunks:
+                return nodes
+            nodes.append(item)
+            for h in item.hunks:
+                if h.lines:
+                    nodes.append(h)
+        elif isinstance(item, Hunk):
+            if item.lines:
+                nodes.append(item)
+        return nodes
+
+    def _fold_tree(self, folded: bool) -> None:
+        """Set fold state on every File and Hunk in the commit.
+
+        Used by ``zM`` / ``zR``. We deliberately *don't* fold the commit
+        row itself — that's the one row whose presence is load-bearing
+        for orientation (it tells you which commit you're looking at).
+        Folding it would just give you a one-row screen of "press l to
+        get started", which is hostile rather than helpful.
+        """
+
+        for f in self.commit.files:
+            if f.hunks:
+                f.folded = folded
+            for h in f.hunks:
+                if h.lines:
+                    h.folded = folded
+        self._invalidate()
+        new_rows = self.visible_rows()
+        if self.cursor >= len(new_rows):
+            self.cursor = len(new_rows) - 1
 
     # -- run loop -------------------------------------------------------
 
@@ -174,6 +236,20 @@ class UI:
             self.help_visible = False
             return True
 
+        # vim-style ``z<x>`` prefix sequences. Resolved before anything
+        # else so a pending ``z`` consumes exactly one follow-up key,
+        # match or no match.
+        if self._pending_z:
+            self._pending_z = False
+            if ch == ord("M"):
+                self._fold_tree(True)
+            elif ch == ord("R"):
+                self._fold_tree(False)
+            # Unknown ``z<x>`` — swallow silently rather than letting
+            # the second key double as both "cancel the prefix" and
+            # its own action. Same as vim.
+            return True
+
         rows = self.visible_rows()
         n = len(rows)
         row = rows[self.cursor]
@@ -182,6 +258,9 @@ class UI:
             return False
         if ch == ord("?"):
             self.help_visible = True
+            return True
+        if ch == ord("z"):
+            self._pending_z = True
             return True
 
         if ch in (ord("j"), curses.KEY_DOWN):
@@ -268,6 +347,23 @@ class UI:
                 if rows[i].kind == row.kind:
                     self.cursor = i
                     break
+
+        elif ch == ord("*"):
+            # Smart subtree toggle: if *anything* under (or at) the
+            # cursor is folded, unfold everything; only when the whole
+            # subtree is already open do we fold it. This makes ``*``
+            # idempotent toward "fully open" in two keypresses no
+            # matter what state you start from.
+            nodes = self._collect_subtree_foldables(row)
+            if nodes:
+                any_closed = any(n.folded for n in nodes)
+                new_state = not any_closed
+                for n in nodes:
+                    n.folded = new_state
+                self._invalidate()
+                new_rows = self.visible_rows()
+                if self.cursor >= len(new_rows):
+                    self.cursor = len(new_rows) - 1
 
         elif ch == ord(" "):
             # crecord uses space to (un-)select; we have no selection,
@@ -419,6 +515,9 @@ class UI:
             "  Folding",
             "    f               fold / unfold current item",
             "    F               fold current + all ancestors",
+            "    *               toggle subtree (open all if any closed)",
+            "    zM              fold every file and hunk",
+            "    zR              unfold every file and hunk",
             "",
             "  Other",
             "    ?               toggle this help",

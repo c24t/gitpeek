@@ -174,3 +174,119 @@ def test_arrow_keys_match_letters() -> None:
     assert ui.cursor == 1
     ui._handle_key(curses.KEY_UP)
     assert ui.cursor == 0
+
+
+def test_zR_unfolds_every_file_and_hunk() -> None:
+    """``zR`` should open every file and hunk in the tree at once."""
+    ui = UI(_toy_commit())
+    ui._handle_key(ord("z"))
+    assert ui._pending_z is True
+    ui._handle_key(ord("R"))
+    assert ui._pending_z is False
+    # Every file + every hunk should now be open.
+    for f in ui.commit.files:
+        assert f.folded is False
+        for h in f.hunks:
+            assert h.folded is False
+    kinds = [r.kind for r in ui.visible_rows()]
+    # Lines still folded by default; we only flipped files & hunks.
+    assert "hunk" in kinds and kinds.count("file") == 2
+
+
+def test_zM_folds_every_file_and_hunk_but_keeps_commit_open() -> None:
+    ui = UI(_toy_commit())
+    # First unfold everything so zM has something to do.
+    ui._handle_key(ord("z"))
+    ui._handle_key(ord("R"))
+    # Now collapse it all.
+    ui._handle_key(ord("z"))
+    ui._handle_key(ord("M"))
+    for f in ui.commit.files:
+        assert f.folded is True
+        for h in f.hunks:
+            assert h.folded is True
+    # Commit row deliberately stays open — orientation.
+    assert ui.commit.folded is False
+    kinds = [r.kind for r in ui.visible_rows()]
+    assert kinds == ["commit", "file", "file"]
+
+
+def test_z_followed_by_unknown_key_is_silent_noop() -> None:
+    """A stray ``j`` after ``z`` should not double as cancel + move."""
+    ui = UI(_toy_commit())
+    ui._handle_key(ord("z"))
+    ui._handle_key(ord("j"))
+    assert ui._pending_z is False
+    # Cursor must not have advanced — the ``j`` was swallowed by the
+    # pending prefix the same way vim eats the second key.
+    assert ui.cursor == 0
+
+
+def test_star_opens_subtree_when_anything_closed() -> None:
+    """On a file row, ``*`` should unfold the file and every hunk under it."""
+    ui = UI(_toy_commit())
+    ui._handle_key(ord("j"))   # cursor → file a.py (folded by default)
+    ui._handle_key(ord("*"))
+    a = ui.commit.files[0]
+    assert a.folded is False
+    for h in a.hunks:
+        assert h.folded is False
+    # The second file should still be untouched.
+    assert ui.commit.files[1].folded is True
+
+
+def test_star_closes_subtree_only_when_fully_open() -> None:
+    """``*`` flips to closed only when *everything* in the subtree is open."""
+    ui = UI(_toy_commit())
+    ui._handle_key(ord("j"))   # → file a.py
+    ui._handle_key(ord("*"))   # fully open
+    a = ui.commit.files[0]
+    assert a.folded is False and all(not h.folded for h in a.hunks)
+    ui._handle_key(ord("*"))   # everything was open → fold subtree
+    assert a.folded is True
+    for h in a.hunks:
+        assert h.folded is True
+
+
+def test_star_with_partial_state_opens_rather_than_closes() -> None:
+    """If even one descendant is closed, ``*`` opens — never closes."""
+    ui = UI(_toy_commit())
+    ui._handle_key(ord("j"))   # → file a.py
+    ui._handle_key(ord("*"))   # fully open
+    # Manually re-fold one hunk to create a mixed state.
+    ui.commit.files[0].hunks[0].folded = True
+    ui._invalidate()
+    ui._handle_key(ord("*"))
+    a = ui.commit.files[0]
+    assert a.folded is False
+    assert all(not h.folded for h in a.hunks)
+
+
+def test_star_on_commit_row_toggles_whole_tree() -> None:
+    ui = UI(_toy_commit())
+    # Cursor starts on the commit row.
+    ui._handle_key(ord("*"))   # anything closed → open all
+    assert ui.commit.folded is False
+    for f in ui.commit.files:
+        assert f.folded is False
+        for h in f.hunks:
+            assert h.folded is False
+    ui._handle_key(ord("*"))   # everything open → close all in subtree
+    # Commit itself is in the subtree, so it folds; that's fine here
+    # because the user explicitly asked for "everything below me".
+    assert ui.commit.folded is True
+
+
+def test_star_on_leaf_line_is_noop() -> None:
+    ui = UI(_toy_commit())
+    # Drill all the way down to a line row.
+    ui._handle_key(ord("j"))
+    ui._handle_key(ord("l"))
+    ui._handle_key(ord("l"))
+    ui._handle_key(ord("l"))
+    ui._handle_key(ord("l"))
+    assert ui.visible_rows()[ui.cursor].kind == "line"
+    before = [(f.folded, [h.folded for h in f.hunks]) for f in ui.commit.files]
+    ui._handle_key(ord("*"))
+    after = [(f.folded, [h.folded for h in f.hunks]) for f in ui.commit.files]
+    assert before == after
