@@ -5,7 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gitpeek"
 version = "0.1.0"
-description = "Read-only, hg crecord-style terminal browser for the current git commit."
+description = "Read-only, hg crecord-style terminal browser for a git log."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{name = "Chris Kleinknecht"}]
 dependencies = []
